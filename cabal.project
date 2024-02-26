@@ -1,0 +1,6 @@
+packages:
+  stackage-tester.cabal
+  -- /home/sergey/projects/haskell/projects/prettyprinter-combinators/prettyprinter-combinators.cabal
+
+-- allow-newer:
+--   , hashable:filepath

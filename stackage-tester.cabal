@@ -1,0 +1,118 @@
+cabal-version: 3.6
+
+-- Created : 10 February 2024
+
+name:
+  stackage-tester
+version:
+  0.1
+synopsis:
+  TODO
+description:
+  TODO
+copyright:
+  (c) Sergey Vinokurov 2024
+license:
+  Apache-2.0
+-- license-file:
+--   LICENSE
+author:
+  Sergey Vinokurov
+maintainer:
+  Sergey Vinokurov <serg.foo@gmail.com>
+
+build-type:
+  Simple
+
+-- build-type: Custom
+--
+-- custom-setup
+--   setup-depends:
+--     , base >= 4.16
+--     , Cabal >= 1.16
+
+extra-source-files:
+  Changelog.md
+  Readme.md
+
+homepage:
+  https://github.com/sergv/stackage-tester
+
+source-repository head
+  type: git
+  location: https://github.com/sergv/stackage-tester.git
+
+common ghc-options
+  default-language:
+    GHC2021
+
+  default-extensions:
+    LambdaCase
+
+  ghc-options:
+    -Weverything
+    -Wno-all-missed-specialisations
+    -Wno-implicit-prelude
+    -Wno-missed-specialisations
+    -Wno-missing-import-lists
+    -Wno-missing-local-signatures
+    -Wno-missing-safe-haskell-mode
+    -Wno-safe
+    -Wno-unsafe
+
+  if impl(ghc >= 8.8)
+    ghc-options:
+      -Wno-missing-deriving-strategies
+
+  -- if impl(ghc >= 8.10)
+  --   ghc-options:
+  --     -Wno-prepositive-qualified-module
+
+  if impl(ghc >= 9.2)
+    ghc-options:
+      -Wno-missing-kind-signatures
+
+  if impl(ghc >= 9.8)
+    ghc-options:
+      -Wno-missing-role-annotations
+      -Wno-missing-poly-kind-signatures
+
+library
+  import: ghc-options
+  exposed-modules:
+    Data.Filesystem
+    Data.NBSem
+  hs-source-dirs:
+    src
+  build-depends:
+    , async
+    , base >= 4.16
+    , exceptions
+    , filepath >= 1.4
+    , directory-ospath-streaming
+
+executable stackage-tester
+  import: ghc-options
+  main-is:
+    exe/StackageTester.hs
+  build-depends:
+    , async
+    , base >= 4.16
+    , directory
+    , file-io
+    , filepath < 1.5
+    , optparse-applicative
+    -- , os-string
+    , prettyprinter
+    , prettyprinter-combinators
+    , stackage-tester
+    , stm
+    , tasty
+    , tasty-hunit
+    , text
+    , typed-process
+  ghc-options:
+    -rtsopts
+    -threaded
+    "-with-rtsopts=-N16 -A128M"
+    -main-is StackageTester
