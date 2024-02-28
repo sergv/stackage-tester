@@ -82,14 +82,18 @@ library
   exposed-modules:
     Data.Filesystem
     Data.NBSem
+    System.OsPath.Ext
   hs-source-dirs:
     src
   build-depends:
     , async
     , base >= 4.16
-    , exceptions
-    , filepath >= 1.4
+    , bytestring
     , directory-ospath-streaming
+    , exceptions
+    , filepath >= 1.4 && < 1.5
+    , text
+    , stm
 
 executable stackage-tester
   import: ghc-options
@@ -100,7 +104,7 @@ executable stackage-tester
     , base >= 4.16
     , directory
     , file-io
-    , filepath < 1.5
+    , filepath >= 1.4 && < 1.5
     , optparse-applicative
     -- , os-string
     , prettyprinter

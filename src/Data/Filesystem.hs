@@ -8,6 +8,7 @@
 
 module Data.Filesystem
   ( FollowSymlinks(..)
+  , findAllCollect
   , findRec
   , AbsDir(..)
   , RelDir(..)
@@ -19,6 +20,8 @@ import Control.Concurrent.Async
 import Control.Monad.Catch
 import Data.Coerce
 import Data.Foldable
+import Data.IORef
+import Data.List.NonEmpty (NonEmpty(..))
 import Data.NBSem
 import GHC.Stack (HasCallStack)
 import System.Directory.OsPath.FileType as Streaming
@@ -35,6 +38,24 @@ newtype AbsDir  = AbsDir  { unAbsDir  :: OsPath }
 newtype RelDir  = RelDir  { unRelDir  :: OsPath }
 newtype AbsFile = AbsFile { unAbsFile :: OsPath }
 newtype RelFile = RelFile { unRelFile :: OsPath }
+
+findAllCollect
+  :: (RelFile -> Bool)
+  -> NonEmpty AbsDir
+  -> IO [AbsFile]
+findAllCollect p dirs = do
+  results <- newIORef []
+  let consume :: AbsFile -> IO ()
+      consume path = atomicModifyIORef' results ((, ()) . (path :))
+
+  findRec
+    FollowSymlinks
+    0
+    (\_ _ -> True)
+    (\_absDir absFile relFile -> pure $ if p relFile then Just absFile else Nothing)
+    consume
+    dirs
+  readIORef results
 
 {-# INLINE findRec #-}
 findRec

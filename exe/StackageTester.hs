@@ -12,6 +12,9 @@
 {-# LANGUAGE RecordWildCards   #-}
 
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
+{-# OPTIONS_GHC -Wno-unused-imports        #-}
+
+{-# OPTIONS_GHC -Wno-deprecations #-}
 
 module StackageTester (main) where
 
@@ -22,6 +25,10 @@ import Control.Monad
 import Control.Monad.Except
 import Data.Bifunctor
 import Data.Bitraversable
+import Data.Filesystem
+import Data.Foldable
+import Data.List.NonEmpty (NonEmpty(..))
+import Data.List.NonEmpty qualified as NE
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
@@ -38,6 +45,7 @@ import System.Directory.OsPath
 import System.Exit
 import System.File.OsPath
 import System.OsPath as OsPath
+import System.OsPath.Ext
 import System.OsString as OsString
 import System.Process.Typed
 import Test.Tasty
@@ -46,8 +54,9 @@ import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
 data Config = Config
-  { cfgWorkDir        :: !OsPath
-  , cfgTestResultsDir :: !OsPath
+  { cfgWorkDir         :: !OsPath
+  , cfgTestResultsDir  :: !OsPath
+  , cfgCabalConfigFile :: !OsPath
   }
 
 parseConfig :: Parser Config
@@ -66,24 +75,23 @@ parseConfig = do
     showDefault <>
     help "Directory to store all the build files in"
 
+  cfgCabalConfigFile <- argument (eitherReader (bimap show id . OsPath.encodeUtf)) $
+    metavar "FILE" <>
+    help "Path to cabal.config with constraints; formatted like https://www.stackage.org/nightly-2023-10-04/cabal.config"
+
   pure Config{..}
 
   where
     defaultWorkDir = [osp|_work|]
 
 data FullConfig = FullConfig
-  { fcfgCabalConfigFile :: !OsPath
-  , fcfgSubconfig       :: !Config
+  { fcfgSubconfig       :: !Config
   , fcfgLimitTests      :: !(Maybe Int)
   , fcfgTastyOpts       :: !Tasty.OptionSet
   }
 
 optsParser :: Parser Tasty.OptionSet -> Parser FullConfig
 optsParser tastyParser = do
-
-  fcfgCabalConfigFile <- argument (eitherReader (bimap show id . OsPath.encodeUtf)) $
-    metavar "FILE" <>
-    help "Path to cabal.config with constraints; formatted like https://www.stackage.org/nightly-2023-10-04/cabal.config"
 
   fcfgSubconfig <- parseConfig
 
@@ -108,14 +116,16 @@ main = do
   let ingredients = defaultIngredients
       tastyParser = snd $ Tasty.suiteOptionParser ingredients $ testGroup "" []
 
-  FullConfig{fcfgCabalConfigFile, fcfgSubconfig, fcfgLimitTests, fcfgTastyOpts} <-
+  FullConfig{fcfgSubconfig, fcfgLimitTests, fcfgTastyOpts} <-
     customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
 
-  pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' fcfgCabalConfigFile
+  let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
+
+  pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
 
   case pkgs of
     [] -> die $ renderString $
-      "Didn't extract any packages from cabal config at" <+> ppShow fcfgCabalConfigFile <> ". Is it valid?"
+      "Didn't extract any packages from cabal config at" <+> ppShow cabalConfigPath <> ". Is it valid?"
     _  -> pure ()
 
   let allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs
@@ -184,7 +194,7 @@ cabalBuildFlags =
   ]
 
 mkTest :: HasCallStack => Config -> Package -> TestTree
-mkTest Config{cfgWorkDir, cfgTestResultsDir} Package{pkgName, pkgVersion} =
+mkTest Config{cfgWorkDir, cfgTestResultsDir, cfgCabalConfigFile} Package{pkgName, pkgVersion} =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsString.encodeUtf fullPkgName
     let pkgDir :: OsPath
@@ -204,11 +214,8 @@ mkTest Config{cfgWorkDir, cfgTestResultsDir} Package{pkgName, pkgVersion} =
       step "Build"
       let buildLog :: OsPath
           buildLog = logDir </> [osp|build-|] <> fullPkgName' <.> [osstr|log|]
-      haveCabalProject <- doesFileExist $ pkgDir </> [osp|cabal.project|]
-      unless haveCabalProject $ do
-        pkgDir </> [osp|cabal.project.local|]
-        T.writeFile
-        -- createFileLink from to
+
+      mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile
 
       buildLog' <- OsPath.decodeUtf buildLog
       runProc (Just pkgDir') "cabal" (["build", "--project-dir", ".", "--build-log", buildLog'] ++ cabalBuildFlags) $ \exitCode stdOut stdErr ->
@@ -216,12 +223,48 @@ mkTest Config{cfgWorkDir, cfgTestResultsDir} Package{pkgName, pkgVersion} =
           [ "Stdout:" ## pretty stdOut
           , "Stderr:" ## pretty stdErr
           ]
-    step "Test"
+
+    do
+      step "Test"
+
+      let testLog :: OsPath
+          testLog = cfgTestResultsDir </> fullPkgName' <.> [osstr|log|]
+
+      testLog' <- OsPath.decodeUtf testLog
+      runProc (Just pkgDir') "cabal" (["test", "--project-dir", ".", "--build-log", testLog', "--test-show-details=always"] ++ cabalBuildFlags) $ \exitCode stdOut stdErr ->
+        "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
+          [ "Stdout:" ## pretty stdOut
+          , "Stderr:" ## pretty stdErr
+          ]
     pure ()
 
   where
     fullPkgName :: String
-    fullPkgName = T.unpack $ pkgName <> "-" <> pkgVersion
+    fullPkgName = T.unpack fullPkgNameText
+    fullPkgNameText :: Text
+    fullPkgNameText = pkgName <> "-" <> pkgVersion
+
+mkCabalProjectLocal :: Text -> AbsDir -> OsPath -> IO ()
+mkCabalProjectLocal fullPkgName pkgDir cabalConfigFile = do
+  let importStr :: Text
+      importStr = "import: " <> pathToText cabalConfigFile
+
+  haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
+  cabalFiles <-
+    if haveCabalProject
+    then
+      pure Nothing
+    else do
+      cabalFiles <- findAllCollect ((== [osstr|.cabal|]) . takeExtension . unRelFile) $ pkgDir :| []
+      case cabalFiles of
+        []     -> error $ renderString $ "Package" <+> pretty fullPkgName <+> "has no cabal files"
+        x : xs -> pure $ Just $ x :| xs
+
+  writeFile' (unAbsDir pkgDir </> [osp|cabal.project.local|]) $ T.encodeUtf8 $ T.unlines $
+    importStr :
+    case cabalFiles of
+      Nothing -> []
+      Just xs -> "packages:" : map (("  " <>) . pathToText . unAbsFile) (toList xs)
 
 runProc :: Maybe FilePath -> String -> [String] -> (Int -> Text -> Text -> Doc ann) -> IO ()
 runProc cwd cmd args msgOnError = do
