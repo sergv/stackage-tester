@@ -12,7 +12,6 @@
 {-# LANGUAGE RecordWildCards   #-}
 
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
-{-# OPTIONS_GHC -Wno-unused-imports        #-}
 
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
@@ -22,19 +21,17 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
-import Control.Monad.Except
 import Data.Bifunctor
 import Data.Bitraversable
+import Data.ByteString.Char8 qualified as C8
 import Data.Filesystem
 import Data.Foldable
 import Data.List.NonEmpty (NonEmpty(..))
-import Data.List.NonEmpty qualified as NE
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
-import Data.Void
 import GHC.Stack
 import Options.Applicative
 import Prettyprinter
@@ -44,6 +41,7 @@ import Prettyprinter.Show
 import System.Directory.OsPath
 import System.Exit
 import System.File.OsPath
+import System.IO (IOMode(..), Handle, hClose)
 import System.OsPath as OsPath
 import System.OsPath.Ext
 import System.OsString as OsString
@@ -54,9 +52,9 @@ import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
 data Config = Config
-  { cfgWorkDir         :: !OsPath
-  , cfgTestResultsDir  :: !OsPath
-  , cfgCabalConfigFile :: !OsPath
+  { cfgWorkDir               :: !OsPath
+  , cfgCabalConfigFile       :: !OsPath
+  , cfgExtraCabalConfigFiles :: ![OsPath]
   }
 
 parseConfig :: Parser Config
@@ -68,16 +66,15 @@ parseConfig = do
     showDefault <>
     help "Path to directory to store all the build files in"
 
-  cfgTestResultsDir  <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
-    long "test-results-dir" <>
-    metavar "DIR" <>
-    value (defaultWorkDir </> [osp|results|]) <>
-    showDefault <>
-    help "Directory to store all the build files in"
-
-  cfgCabalConfigFile <- argument (eitherReader (bimap show id . OsPath.encodeUtf)) $
+  cfgCabalConfigFile <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
+    long "cabal-config-main" <>
     metavar "FILE" <>
     help "Path to cabal.config with constraints; formatted like https://www.stackage.org/nightly-2023-10-04/cabal.config"
+
+  cfgExtraCabalConfigFiles <- many $ option (eitherReader (bimap show id . OsPath.encodeUtf)) $
+    long "extra-cabal-config" <>
+    metavar "FILE" <>
+    help "Path to cabal.config with auxiliary build options to take effect during builds"
 
   pure Config{..}
 
@@ -108,6 +105,17 @@ progInfo tastyParser = info
   (helper <*> optsParser tastyParser)
   (fullDesc <> header "Build stackage LTS snapshot and run tests.")
 
+resolveRelativePaths :: Config -> IO Config
+resolveRelativePaths Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} = do
+  cfgWorkDir'               <- makeAbsolute cfgWorkDir
+  cfgCabalConfigFile'       <- makeAbsolute cfgCabalConfigFile
+  cfgExtraCabalConfigFiles' <- traverse makeAbsolute cfgExtraCabalConfigFiles
+  pure Config
+    { cfgWorkDir               = cfgWorkDir'
+    , cfgCabalConfigFile       = cfgCabalConfigFile'
+    , cfgExtraCabalConfigFiles = cfgExtraCabalConfigFiles'
+    }
+
 main :: IO ()
 main = do
 
@@ -119,7 +127,9 @@ main = do
   FullConfig{fcfgSubconfig, fcfgLimitTests, fcfgTastyOpts} <-
     customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
 
-  let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
+  fcfgSubconfig' <- resolveRelativePaths fcfgSubconfig
+
+  let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig'
 
   pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
 
@@ -128,10 +138,18 @@ main = do
       "Didn't extract any packages from cabal config at" <+> ppShow cabalConfigPath <> ". Is it valid?"
     _  -> pure ()
 
-  let allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs
+  for_ (cfgExtraCabalConfigFiles fcfgSubconfig') $ \path -> do
+    exists <- doesFileExist path
+    unless exists $
+      die $ renderString $ "Extra cabal config file does not exist:" <+> ppShow path
 
-  createDirectoryIfMissing True $ cfgWorkDir fcfgSubconfig
-  createDirectoryIfMissing True $ cfgTestResultsDir fcfgSubconfig
+  let allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig') $ maybe id take fcfgLimitTests pkgs
+
+  let workDir = cfgWorkDir fcfgSubconfig'
+  createDirectoryIfMissing True $ workDir
+  createDirectoryIfMissing True $ workDir </> [osp|pkgs|]
+  createDirectoryIfMissing True $ workDir </> [osp|build-logs|]
+  createDirectoryIfMissing True $ workDir </> [osp|test-logs|]
 
   case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
     Nothing  ->
@@ -191,51 +209,71 @@ cabalBuildFlags =
   , "--disable-documentation"
   , "--enable-tests"
   , "--allow-newer"
+  , "--enable-optimization"
   ]
 
 mkTest :: HasCallStack => Config -> Package -> TestTree
-mkTest Config{cfgWorkDir, cfgTestResultsDir, cfgCabalConfigFile} Package{pkgName, pkgVersion} =
+mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{pkgName, pkgVersion} =
   testCaseSteps fullPkgName $ \step -> do
-    (fullPkgName' :: OsPath) <- OsString.encodeUtf fullPkgName
-    let pkgDir :: OsPath
-        pkgDir = cfgWorkDir </> fullPkgName'
+    (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
+    let pkgsDir :: OsPath
+        pkgsDir = cfgWorkDir </> [osp|pkgs|]
 
-        logDir = cfgWorkDir </> [osp|logs|]
+        pkgDir :: OsPath
+        pkgDir = pkgsDir </> fullPkgName'
+
+        buildLogDir = cfgWorkDir </> [osp|build-logs|]
+        testLogDir  = cfgWorkDir </> [osp|test-logs|]
+
     alreadyDownloaded <- doesDirectoryExist pkgDir
-    pkgDir' <- OsPath.decodeUtf pkgDir
     unless alreadyDownloaded $ do
       step "Unpack"
-      runProc Nothing "cabal" ["get", "--destdir", pkgDir'] $ \exitCode stdOut stdErr ->
+      pkgsDir' <- OsPath.decodeUtf pkgsDir
+      runProc' Nothing "cabal" ["get", "--destdir", pkgsDir', fullPkgName] $ \exitCode stdOut stdErr ->
         "Unpacking of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode ## vcat
           [ "Stdout:" ## pretty stdOut
           , "Stderr:" ## pretty stdErr
           ]
+
+    pkgDir' <- OsPath.decodeUtf pkgDir
     do
       step "Build"
       let buildLog :: OsPath
-          buildLog = logDir </> [osp|build-|] <> fullPkgName' <.> [osstr|log|]
+          buildLog = buildLogDir </> [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
 
-      mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile
+          buildLogTmp = buildLog <> [osstr|.tmp|]
 
-      buildLog' <- OsPath.decodeUtf buildLog
-      runProc (Just pkgDir') "cabal" (["build", "--project-dir", ".", "--build-log", buildLog'] ++ cabalBuildFlags) $ \exitCode stdOut stdErr ->
-        "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## vcat
-          [ "Stdout:" ## pretty stdOut
-          , "Stderr:" ## pretty stdErr
-          ]
+      mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
+
+      -- buildLog' <- OsPath.decodeUtf buildLog
+
+      (`finally` (doesFileExist buildLogTmp >>= \e -> when e (removeFile buildLogTmp))) $
+        withFile buildLogTmp WriteMode $ \buildLogH ->
+          runProc buildLogH (Just pkgDir') "cabal" (["build", "--project-dir", ".", "all", "-j2"] ++ cabalBuildFlags)
+            (do
+              hClose buildLogH
+              firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
+              unless (firstLine == "Up to date") $
+                renameFile buildLogTmp buildLog)
+            (\exitCode -> do
+              renameFile buildLogTmp buildLog
+              output <- T.decodeUtf8 <$> readFile' buildLog
+              pure $
+                "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## pretty output)
 
     do
       step "Test"
 
       let testLog :: OsPath
-          testLog = cfgTestResultsDir </> fullPkgName' <.> [osstr|log|]
+          testLog = testLogDir </> [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
 
       testLog' <- OsPath.decodeUtf testLog
-      runProc (Just pkgDir') "cabal" (["test", "--project-dir", ".", "--build-log", testLog', "--test-show-details=always"] ++ cabalBuildFlags) $ \exitCode stdOut stdErr ->
-        "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
-          [ "Stdout:" ## pretty stdOut
-          , "Stderr:" ## pretty stdErr
-          ]
+      runProc' (Just pkgDir') "cabal" (["test", "--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"] ++ cabalBuildFlags)
+        (\exitCode stdOut stdErr ->
+          "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
+            [ "stdout:" ## pretty stdOut
+            , "stderr:" ## pretty stdErr
+            ])
     pure ()
 
   where
@@ -244,10 +282,10 @@ mkTest Config{cfgWorkDir, cfgTestResultsDir, cfgCabalConfigFile} Package{pkgName
     fullPkgNameText :: Text
     fullPkgNameText = pkgName <> "-" <> pkgVersion
 
-mkCabalProjectLocal :: Text -> AbsDir -> OsPath -> IO ()
-mkCabalProjectLocal fullPkgName pkgDir cabalConfigFile = do
+mkCabalProjectLocal :: Text -> AbsDir -> OsPath -> [OsPath] -> IO ()
+mkCabalProjectLocal fullPkgName pkgDir cabalConfigFile extraConfigs = do
   let importStr :: Text
-      importStr = "import: " <> pathToText cabalConfigFile
+      importStr = T.unlines $ map (\p -> "import: " <> pathToText p) $ cabalConfigFile : extraConfigs
 
   haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
   cabalFiles <-
@@ -266,20 +304,71 @@ mkCabalProjectLocal fullPkgName pkgDir cabalConfigFile = do
       Nothing -> []
       Just xs -> "packages:" : map (("  " <>) . pathToText . unAbsFile) (toList xs)
 
-runProc :: Maybe FilePath -> String -> [String] -> (Int -> Text -> Text -> Doc ann) -> IO ()
-runProc cwd cmd args msgOnError = do
+runProc
+  :: Handle
+  -> Maybe FilePath
+  -> String
+  -> [String]
+  -> IO ()
+  -> (Int -> IO (Doc ann))
+  -> IO ()
+runProc out cwd cmd args onSuccess msgOnError = do
+  let p = setStdin closed
+        $ setStdout (useHandleClose out)
+        $ setStderr (useHandleClose out)
+        $ maybe id setWorkingDir cwd
+        $ proc cmd args
+
+  when debug $
+    putStrLn $ "Running " ++ show (cmd : args) ++ " in " ++ show cwd
+
+  withProcessWait p $ \p' -> do
+    -- let decode = evaluate . TL.toStrict . TL.decodeUtf8
+    -- (!stdOut, !stdErr) <- bitraverse decode decode =<<
+    --   concurrently (atomically (getStdout p')) (atomically (getStderr p'))
+    -- when debug $ do
+    --   unless (T.null stdOut) $
+    --     putStrLn $ "stdOut:\n" ++ show stdOut
+    --   unless (T.null stdErr) $
+    --     putStrLn $ "stdErr:\n" ++ show stdErr
+    exitCode <- waitExitCode p'
+    case exitCode of
+      ExitFailure x ->
+        assertFailure . renderString =<< msgOnError x
+      ExitSuccess   ->
+        onSuccess
+
+runProc'
+  :: Maybe FilePath
+  -> String
+  -> [String]
+  -> (Int -> Text -> Text -> Doc ann)
+  -> IO ()
+runProc' cwd cmd args msgOnError = do
   let p = setStdin closed
         $ setStdout byteStringOutput
         $ setStderr byteStringOutput
         $ maybe id setWorkingDir cwd
         $ proc cmd args
 
+  when debug $
+    putStrLn $ "Running " ++ show (cmd : args) ++ " in " ++ show cwd
+
   withProcessWait p $ \p' -> do
     let decode = evaluate . TL.toStrict . TL.decodeUtf8
     (!stdOut, !stdErr) <- bitraverse decode decode =<<
       concurrently (atomically (getStdout p')) (atomically (getStderr p'))
+    when debug $ do
+      unless (T.null stdOut) $
+        putStrLn $ "stdOut:\n" ++ show stdOut
+      unless (T.null stdErr) $
+        putStrLn $ "stdErr:\n" ++ show stdErr
     exitCode <- waitExitCode p'
     case exitCode of
-      ExitFailure x -> do
+      ExitFailure x ->
         assertFailure $ renderString $ msgOnError x stdOut stdErr
       ExitSuccess   -> pure ()
+
+
+debug :: Bool
+debug = False
