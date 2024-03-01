@@ -143,7 +143,8 @@ main = do
     unless exists $
       die $ renderString $ "Extra cabal config file does not exist:" <+> ppShow path
 
-  let allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig') $ maybe id take fcfgLimitTests pkgs
+  let pkgs'    = filter ((/= "installed") . pkgVersion) pkgs
+      allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig') $ maybe id take fcfgLimitTests pkgs'
 
   let workDir = cfgWorkDir fcfgSubconfig'
   createDirectoryIfMissing True $ workDir
