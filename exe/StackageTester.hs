@@ -257,6 +257,7 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{
               unless (firstLine == "Up to date") $
                 renameFile buildLogTmp buildLog)
             (\exitCode -> do
+              hClose buildLogH
               renameFile buildLogTmp buildLog
               output <- T.decodeUtf8 <$> readFile' buildLog
               pure $
