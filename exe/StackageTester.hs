@@ -211,6 +211,7 @@ cabalBuildFlags =
   , "--enable-tests"
   , "--allow-newer"
   , "--enable-optimization"
+  , "--remote-build-reporting=none"
   ]
 
 mkTest :: HasCallStack => Config -> Package -> TestTree
@@ -250,14 +251,12 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{
 
       (`finally` (doesFileExist buildLogTmp >>= \e -> when e (removeFile buildLogTmp))) $
         withFile buildLogTmp WriteMode $ \buildLogH ->
-          runProc buildLogH (Just pkgDir') "cabal" (["build", "--project-dir", ".", "all", "-j2"] ++ cabalBuildFlags)
+          runProc buildLogH (Just pkgDir') "cabal" (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
             (do
-              hClose buildLogH
               firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
               unless (firstLine == "Up to date") $
                 renameFile buildLogTmp buildLog)
             (\exitCode -> do
-              hClose buildLogH
               renameFile buildLogTmp buildLog
               output <- T.decodeUtf8 <$> readFile' buildLog
               pure $
@@ -270,7 +269,7 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{
           testLog = testLogDir </> [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
 
       testLog' <- OsPath.decodeUtf testLog
-      runProc' (Just pkgDir') "cabal" (["test", "--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"] ++ cabalBuildFlags)
+      runProc' (Just pkgDir') "cabal" (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"])
         (\exitCode stdOut stdErr ->
           "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
             [ "stdout:" ## pretty stdOut
@@ -325,15 +324,8 @@ runProc out cwd cmd args onSuccess msgOnError = do
     putStrLn $ "Running " ++ show (cmd : args) ++ " in " ++ show cwd
 
   withProcessWait p $ \p' -> do
-    -- let decode = evaluate . TL.toStrict . TL.decodeUtf8
-    -- (!stdOut, !stdErr) <- bitraverse decode decode =<<
-    --   concurrently (atomically (getStdout p')) (atomically (getStderr p'))
-    -- when debug $ do
-    --   unless (T.null stdOut) $
-    --     putStrLn $ "stdOut:\n" ++ show stdOut
-    --   unless (T.null stdErr) $
-    --     putStrLn $ "stdErr:\n" ++ show stdErr
     exitCode <- waitExitCode p'
+    hClose out
     case exitCode of
       ExitFailure x ->
         assertFailure . renderString =<< msgOnError x
