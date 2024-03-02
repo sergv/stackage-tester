@@ -315,7 +315,7 @@ runProc
   -> (Int -> IO (Doc ann))
   -> IO ()
 runProc out cwd cmd args onSuccess msgOnError = do
-  let p = setStdin closed
+  let p = setStdin nullStream
         $ setStdout (useHandleClose out)
         $ setStderr (useHandleClose out)
         $ maybe id setWorkingDir cwd
@@ -347,7 +347,7 @@ runProc'
   -> (Int -> Text -> Text -> Doc ann)
   -> IO ()
 runProc' cwd cmd args msgOnError = do
-  let p = setStdin closed
+  let p = setStdin nullStream
         $ setStdout byteStringOutput
         $ setStderr byteStringOutput
         $ maybe id setWorkingDir cwd
