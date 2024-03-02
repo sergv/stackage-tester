@@ -55,7 +55,11 @@ data Config = Config
   { cfgWorkDir               :: !OsPath
   , cfgCabalConfigFile       :: !OsPath
   , cfgExtraCabalConfigFiles :: ![OsPath]
+  , cfgDoRecompress          :: !Bool
   }
+
+recompressFlag :: String
+recompressFlag = "recompress"
 
 parseConfig :: Parser Config
 parseConfig = do
@@ -75,6 +79,10 @@ parseConfig = do
     long "extra-cabal-config" <>
     metavar "FILE" <>
     help "Path to cabal.config with auxiliary build options to take effect during builds"
+
+  cfgDoRecompress <- switch $
+    long recompressFlag <>
+    help "Do recompression of the build directory after we’ve finished building"
 
   pure Config{..}
 
@@ -106,7 +114,7 @@ progInfo tastyParser = info
   (fullDesc <> header "Build stackage LTS snapshot and run tests.")
 
 resolveRelativePaths :: Config -> IO Config
-resolveRelativePaths Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} = do
+resolveRelativePaths Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRecompress} = do
   cfgWorkDir'               <- makeAbsolute cfgWorkDir
   cfgCabalConfigFile'       <- makeAbsolute cfgCabalConfigFile
   cfgExtraCabalConfigFiles' <- traverse makeAbsolute cfgExtraCabalConfigFiles
@@ -114,6 +122,7 @@ resolveRelativePaths Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigF
     { cfgWorkDir               = cfgWorkDir'
     , cfgCabalConfigFile       = cfgCabalConfigFile'
     , cfgExtraCabalConfigFiles = cfgExtraCabalConfigFiles'
+    , cfgDoRecompress
     }
 
 main :: IO ()
@@ -142,6 +151,12 @@ main = do
     exists <- doesFileExist path
     unless exists $
       die $ renderString $ "Extra cabal config file does not exist:" <+> ppShow path
+
+  when (cfgDoRecompress fcfgSubconfig) $ do
+    haveBtrfs <- findExecutable [osp|btrfs|]
+    case haveBtrfs of
+      Nothing -> die $ "Could not find ‘btrfs’ executable for " ++ ("--" ++ recompressFlag) ++ " to work. Try ‘apt install btrfs-progs’ or equivalent."
+      Just{}  -> pure ()
 
   let pkgs'    = filter ((/= "installed") . pkgVersion) pkgs
       allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig') $ maybe id take fcfgLimitTests pkgs'
@@ -214,8 +229,18 @@ cabalBuildFlags =
   , "--remote-build-reporting=none"
   ]
 
+recompress :: OsPath -> IO ()
+recompress path = do
+  path' <- OsPath.decodeUtf path
+  runProc' Nothing "btrfs" ["filesystem", "defragment", "-r", "-czstd", path']
+    (\exitCode stdOut stdErr ->
+      "Recompression of" <+> ppShow path <+> "failed with exit code" <+> pretty exitCode ## vcat
+        [ "stdout:" ## pretty stdOut
+        , "stderr:" ## pretty stdErr
+        ])
+
 mkTest :: HasCallStack => Config -> Package -> TestTree
-mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{pkgName, pkgVersion} =
+mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRecompress} Package{pkgName, pkgVersion} =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
     let pkgsDir :: OsPath
@@ -227,55 +252,58 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles} Package{
         buildLogDir = cfgWorkDir </> [osp|build-logs|]
         testLogDir  = cfgWorkDir </> [osp|test-logs|]
 
-    alreadyDownloaded <- doesDirectoryExist pkgDir
-    unless alreadyDownloaded $ do
-      step "Unpack"
-      pkgsDir' <- OsPath.decodeUtf pkgsDir
-      runProc' Nothing "cabal" ["get", "--destdir", pkgsDir', fullPkgName] $ \exitCode stdOut stdErr ->
-        "Unpacking of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode ## vcat
-          [ "Stdout:" ## pretty stdOut
-          , "Stderr:" ## pretty stdErr
-          ]
+    (if cfgDoRecompress then (`finally` recompress pkgDir) else id) $ do
 
-    pkgDir' <- OsPath.decodeUtf pkgDir
-    do
-      step "Build"
-      let buildLog :: OsPath
-          buildLog = buildLogDir </> [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
+      alreadyDownloaded <- doesDirectoryExist pkgDir
+      unless alreadyDownloaded $ do
+        step "Unpack"
+        pkgsDir' <- OsPath.decodeUtf pkgsDir
+        runProc' Nothing "cabal" ["get", "--destdir", pkgsDir', fullPkgName] $ \exitCode stdOut stdErr ->
+          "Unpacking of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode ## vcat
+            [ "Stdout:" ## pretty stdOut
+            , "Stderr:" ## pretty stdErr
+            ]
 
-          buildLogTmp = buildLog <> [osstr|.tmp|]
+      pkgDir' <- OsPath.decodeUtf pkgDir
 
-      mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
+      do
+        step "Build"
+        let buildLog :: OsPath
+            buildLog = buildLogDir </> [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
 
-      -- buildLog' <- OsPath.decodeUtf buildLog
+            buildLogTmp = buildLog <> [osstr|.tmp|]
 
-      (`finally` (doesFileExist buildLogTmp >>= \e -> when e (removeFile buildLogTmp))) $
-        withFile buildLogTmp WriteMode $ \buildLogH ->
-          runProc buildLogH (Just pkgDir') "cabal" (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
-            (do
-              firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
-              unless (firstLine == "Up to date") $
-                renameFile buildLogTmp buildLog)
-            (\exitCode -> do
-              renameFile buildLogTmp buildLog
-              output <- T.decodeUtf8 <$> readFile' buildLog
-              pure $
-                "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## pretty output)
+        mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
 
-    do
-      step "Test"
+        -- buildLog' <- OsPath.decodeUtf buildLog
 
-      let testLog :: OsPath
-          testLog = testLogDir </> [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
+        (`finally` (doesFileExist buildLogTmp >>= \e -> when e (removeFile buildLogTmp))) $
+          withFile buildLogTmp WriteMode $ \buildLogH ->
+            runProc buildLogH (Just pkgDir') "cabal" (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
+              (do
+                firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
+                unless (firstLine == "Up to date") $ do
+                  renameFile buildLogTmp buildLog)
+              (\exitCode -> do
+                renameFile buildLogTmp buildLog
+                output <- T.decodeUtf8 <$> readFile' buildLog
+                pure $
+                  "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## pretty output)
 
-      testLog' <- OsPath.decodeUtf testLog
-      runProc' (Just pkgDir') "cabal" (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"])
-        (\exitCode stdOut stdErr ->
-          "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
-            [ "stdout:" ## pretty stdOut
-            , "stderr:" ## pretty stdErr
-            ])
-    pure ()
+      do
+        step "Test"
+
+        let testLog :: OsPath
+            testLog = testLogDir </> [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
+
+        testLog' <- OsPath.decodeUtf testLog
+        runProc' (Just pkgDir') "cabal" (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"])
+          (\exitCode stdOut stdErr ->
+            "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
+              [ "stdout:" ## pretty stdOut
+              , "stderr:" ## pretty stdErr
+              ])
+      pure ()
 
   where
     fullPkgName :: String
