@@ -34,7 +34,7 @@ import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
 import GHC.Stack
 import Options.Applicative
-import Prettyprinter
+import Prettyprinter hiding (dquote)
 import Prettyprinter.Combinators
 import Prettyprinter.Generics
 import Prettyprinter.Show
@@ -42,6 +42,7 @@ import System.Directory.OsPath
 import System.Exit
 import System.File.OsPath
 import System.IO (IOMode(..), Handle, hClose)
+import System.IO.Temp.OsPath
 import System.OsPath as OsPath
 import System.OsPath.Ext
 import System.OsString as OsString
@@ -52,24 +53,12 @@ import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
 data Config = Config
-  { cfgWorkDir               :: !OsPath
-  , cfgCabalConfigFile       :: !OsPath
+  { cfgCabalConfigFile       :: !OsPath
   , cfgExtraCabalConfigFiles :: ![OsPath]
-  , cfgDoRecompress          :: !Bool
   }
-
-recompressFlag :: String
-recompressFlag = "recompress"
 
 parseConfig :: Parser Config
 parseConfig = do
-  cfgWorkDir         <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
-    long "work-dir" <>
-    metavar "DIR" <>
-    value defaultWorkDir <>
-    showDefault <>
-    help "Path to directory to store all the build files in"
-
   cfgCabalConfigFile <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
     long "cabal-config-main" <>
     metavar "FILE" <>
@@ -80,25 +69,25 @@ parseConfig = do
     metavar "FILE" <>
     help "Path to cabal.config with auxiliary build options to take effect during builds"
 
-  cfgDoRecompress <- switch $
-    long recompressFlag <>
-    help "Do recompression of the build directory after we’ve finished building"
-
   pure Config{..}
-
-  where
-    defaultWorkDir = [osp|_work|]
 
 data FullConfig = FullConfig
   { fcfgSubconfig       :: !Config
+  , fcfgLogsDir         :: !OsPath
   , fcfgLimitTests      :: !(Maybe Int)
   , fcfgTastyOpts       :: !Tasty.OptionSet
   }
 
 optsParser :: Parser Tasty.OptionSet -> Parser FullConfig
 optsParser tastyParser = do
-
   fcfgSubconfig <- parseConfig
+
+  fcfgLogsDir   <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
+    long "logs-dir" <>
+    metavar "DIR" <>
+    value defaultLogsDir <>
+    showDefault <>
+    help "Path to directory to store all the build files in"
 
   fcfgLimitTests <- optional $ option auto $
     long "limit-tests" <>
@@ -107,22 +96,59 @@ optsParser tastyParser = do
   fcfgTastyOpts <- tastyParser
 
   pure FullConfig{..}
+  where
+    defaultLogsDir = [osp|_logs|]
 
 progInfo :: Parser Tasty.OptionSet -> ParserInfo FullConfig
 progInfo tastyParser = info
   (helper <*> optsParser tastyParser)
   (fullDesc <> header "Build stackage LTS snapshot and run tests.")
 
-resolveRelativePaths :: Config -> IO Config
-resolveRelativePaths Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRecompress} = do
-  cfgWorkDir'               <- makeAbsolute cfgWorkDir
-  cfgCabalConfigFile'       <- makeAbsolute cfgCabalConfigFile
-  cfgExtraCabalConfigFiles' <- traverse makeAbsolute cfgExtraCabalConfigFiles
-  pure Config
-    { cfgWorkDir               = cfgWorkDir'
-    , cfgCabalConfigFile       = cfgCabalConfigFile'
-    , cfgExtraCabalConfigFiles = cfgExtraCabalConfigFiles'
-    , cfgDoRecompress
+resolveRelativePaths :: FullConfig -> IO FullConfig
+resolveRelativePaths fcfg@FullConfig{fcfgSubconfig, fcfgLogsDir} = do
+  fcfgLogsDir'   <- makeAbsolute fcfgLogsDir
+  fcfgSubconfig' <- resolveRelativePaths' fcfgSubconfig
+  pure fcfg
+    { fcfgSubconfig = fcfgSubconfig'
+    , fcfgLogsDir   = fcfgLogsDir'
+    }
+  where
+    resolveRelativePaths' :: Config -> IO Config
+    resolveRelativePaths' cfg@Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles} = do
+      cfgCabalConfigFile'       <- makeAbsolute cfgCabalConfigFile
+      cfgExtraCabalConfigFiles' <- traverse makeAbsolute cfgExtraCabalConfigFiles
+      pure cfg
+        { cfgCabalConfigFile       = cfgCabalConfigFile'
+        , cfgExtraCabalConfigFiles = cfgExtraCabalConfigFiles'
+        }
+
+data DirConfig = DirConfig
+  { dcLogsDir             :: !OsPath
+  , dcBuildLogsSuccessDir :: !OsPath
+  , dcBuildLogsFailedDir  :: !OsPath
+  , dcTestLogsSuccessDir  :: !OsPath
+  , dcTestLogsFailedDir   :: !OsPath
+  }
+
+withDirs :: OsPath -> (DirConfig -> IO a) -> IO a
+withDirs logsDir k = do
+  let dcBuildLogsSuccessDir = logsDir </> [osp|build-logs|]
+      dcBuildLogsFailedDir  = logsDir </> [osp|build-logs-failed|]
+      dcTestLogsSuccessDir  = logsDir </> [osp|test-logs|]
+      dcTestLogsFailedDir   = logsDir </> [osp|test-logs-failed|]
+
+  createDirectoryIfMissing True logsDir
+  createDirectoryIfMissing True dcBuildLogsSuccessDir
+  createDirectoryIfMissing True dcBuildLogsFailedDir
+  createDirectoryIfMissing True dcTestLogsSuccessDir
+  createDirectoryIfMissing True dcTestLogsFailedDir
+
+  k $ DirConfig
+    { dcLogsDir = logsDir
+    , dcBuildLogsSuccessDir
+    , dcBuildLogsFailedDir
+    , dcTestLogsSuccessDir
+    , dcTestLogsFailedDir
     }
 
 main :: IO ()
@@ -133,48 +159,35 @@ main = do
   let ingredients = defaultIngredients
       tastyParser = snd $ Tasty.suiteOptionParser ingredients $ testGroup "" []
 
-  FullConfig{fcfgSubconfig, fcfgLimitTests, fcfgTastyOpts} <-
-    customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
+  FullConfig{fcfgSubconfig, fcfgLogsDir, fcfgLimitTests, fcfgTastyOpts} <-
+    resolveRelativePaths =<< customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
 
-  fcfgSubconfig' <- resolveRelativePaths fcfgSubconfig
-
-  let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig'
+  let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
 
   pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
 
-  case pkgs of
+  let pkgs' = filter ((/= "installed") . pkgVersion) pkgs
+
+  case pkgs' of
     [] -> die $ renderString $
       "Didn't extract any packages from cabal config at" <+> ppShow cabalConfigPath <> ". Is it valid?"
     _  -> pure ()
 
-  for_ (cfgExtraCabalConfigFiles fcfgSubconfig') $ \path -> do
+  for_ (cfgExtraCabalConfigFiles fcfgSubconfig) $ \path -> do
     exists <- doesFileExist path
     unless exists $
       die $ renderString $ "Extra cabal config file does not exist:" <+> ppShow path
 
-  when (cfgDoRecompress fcfgSubconfig) $ do
-    haveBtrfs <- findExecutable [osp|btrfs|]
-    case haveBtrfs of
-      Nothing -> die $ "Could not find ‘btrfs’ executable for " ++ ("--" ++ recompressFlag) ++ " to work. Try ‘apt install btrfs-progs’ or equivalent."
-      Just{}  -> pure ()
+  withDirs fcfgLogsDir $ \dirs -> do
+    let allTests = testGroup "Tests" $ map (mkTest dirs fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs'
+    case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
+      Nothing  ->
+        die "No ingredients agreed to run. Something is wrong either with your ingredient set or the options."
+      Just act -> do
+        ok <- act
+        if ok then exitSuccess else exitFailure
 
-  let pkgs'    = filter ((/= "installed") . pkgVersion) pkgs
-      allTests = testGroup "Tests" $ map (mkTest fcfgSubconfig') $ maybe id take fcfgLimitTests pkgs'
-
-  let workDir = cfgWorkDir fcfgSubconfig'
-  createDirectoryIfMissing True $ workDir
-  createDirectoryIfMissing True $ workDir </> [osp|pkgs|]
-  createDirectoryIfMissing True $ workDir </> [osp|build-logs|]
-  createDirectoryIfMissing True $ workDir </> [osp|test-logs|]
-
-  case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
-    Nothing  ->
-      die "No ingredients agreed to run. Something is wrong either with your ingredient set or the options."
-    Just act -> do
-      ok <- act
-      if ok then exitSuccess else exitFailure
-
-  pure ()
+    pure ()
 
 data Package = Package
   { pkgName    :: !Text
@@ -182,6 +195,9 @@ data Package = Package
   }
   deriving stock (Show, Generic)
   deriving Pretty via PPGeneric Package
+
+getFullPkgName :: Package -> Text
+getFullPkgName Package{pkgName, pkgVersion} = pkgName <> "-" <> pkgVersion
 
 -- data LocatedDoc = LocatedDoc
 --   { ldMsg       :: !(Doc Void)
@@ -229,35 +245,23 @@ cabalBuildFlags =
   , "--remote-build-reporting=none"
   ]
 
-recompress :: OsPath -> IO ()
-recompress path = do
-  path' <- OsPath.decodeUtf path
-  runProc' Nothing "btrfs" ["filesystem", "defragment", "-r", "-czstd", path']
-    (\exitCode stdOut stdErr ->
-      "Recompression of" <+> ppShow path <+> "failed with exit code" <+> pretty exitCode ## vcat
-        [ "stdout:" ## pretty stdOut
-        , "stderr:" ## pretty stdErr
-        ])
-
-mkTest :: HasCallStack => Config -> Package -> TestTree
-mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRecompress} Package{pkgName, pkgVersion} =
+mkTest :: HasCallStack => DirConfig -> Config -> Package -> TestTree
+mkTest
+  DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
+  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles}
+  pkg =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
-    let pkgsDir :: OsPath
-        pkgsDir = cfgWorkDir </> [osp|pkgs|]
 
-        pkgDir :: OsPath
-        pkgDir = pkgsDir </> fullPkgName'
+    withSystemTempDirectory ([osp|workdir-|] <> fullPkgName') $ \tmpDir -> do
 
-        buildLogDir = cfgWorkDir </> [osp|build-logs|]
-        testLogDir  = cfgWorkDir </> [osp|test-logs|]
-
-    (if cfgDoRecompress then (`finally` recompress pkgDir) else id) $ do
+      let pkgDir :: OsPath
+          pkgDir = tmpDir </> fullPkgName'
 
       alreadyDownloaded <- doesDirectoryExist pkgDir
       unless alreadyDownloaded $ do
         step "Unpack"
-        pkgsDir' <- OsPath.decodeUtf pkgsDir
+        pkgsDir' <- OsPath.decodeUtf tmpDir
         runProc' Nothing "cabal" ["get", "--destdir", pkgsDir', fullPkgName] $ \exitCode stdOut stdErr ->
           "Unpacking of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode ## vcat
             [ "Stdout:" ## pretty stdOut
@@ -269,24 +273,25 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRec
       do
         step "Build"
         let buildLog :: OsPath
-            buildLog = buildLogDir </> [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
+            buildLog = [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
 
-            buildLogTmp = buildLog <> [osstr|.tmp|]
+            buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
 
         mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
 
-        -- buildLog' <- OsPath.decodeUtf buildLog
-
-        (`finally` (doesFileExist buildLogTmp >>= \e -> when e (removeFile buildLogTmp))) $
+        (`finally` removeFileIfExists buildLogTmp) $
           withFile buildLogTmp WriteMode $ \buildLogH ->
-            runProc buildLogH (Just pkgDir') "cabal" (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
+            runProc buildLogH (Just pkgDir')
+              "cabal"
+              (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
-                  renameFile buildLogTmp buildLog)
+                  renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
               (\exitCode -> do
-                renameFile buildLogTmp buildLog
-                output <- T.decodeUtf8 <$> readFile' buildLog
+                let dest = dcBuildLogsFailedDir </> buildLog
+                renameFile buildLogTmp dest
+                output <- T.decodeUtf8 <$> readFile' dest
                 pure $
                   "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## pretty output)
 
@@ -294,22 +299,35 @@ mkTest Config{cfgWorkDir, cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgDoRec
         step "Test"
 
         let testLog :: OsPath
-            testLog = testLogDir </> [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
+            testLog = [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
 
-        testLog' <- OsPath.decodeUtf testLog
-        runProc' (Just pkgDir') "cabal" (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "--test-log", testLog', "--test-show-details=always", "all"])
-          (\exitCode stdOut stdErr ->
-            "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## vcat
-              [ "stdout:" ## pretty stdOut
-              , "stderr:" ## pretty stdErr
-              ])
+            testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
+
+        (`finally` removeFileIfExists testLogTmp) $
+          withFile testLogTmp WriteMode $ \testLogH ->
+            runProc testLogH (Just pkgDir')
+              "cabal"
+              (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all"])
+              (do
+                renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
+              (\exitCode -> do
+                let dest = dcTestLogsFailedDir </> testLog
+                renameFile testLogTmp dest
+                output <- T.decodeUtf8 <$> readFile' dest
+                pure $ "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## pretty output)
+
       pure ()
-
   where
     fullPkgName :: String
     fullPkgName = T.unpack fullPkgNameText
     fullPkgNameText :: Text
-    fullPkgNameText = pkgName <> "-" <> pkgVersion
+    fullPkgNameText = getFullPkgName pkg
+
+removeFileIfExists :: OsPath -> IO ()
+removeFileIfExists path = do
+  exists <- doesFileExist path
+  when exists $
+    removeFile path
 
 mkCabalProjectLocal :: Text -> AbsDir -> OsPath -> [OsPath] -> IO ()
 mkCabalProjectLocal fullPkgName pkgDir cabalConfigFile extraConfigs = do
@@ -390,7 +408,6 @@ runProc' cwd cmd args msgOnError = do
       ExitFailure x ->
         assertFailure $ renderString $ msgOnError x stdOut stdErr
       ExitSuccess   -> pure ()
-
 
 debug :: Bool
 debug = False

@@ -83,6 +83,7 @@ library
     Data.Filesystem
     Data.NBSem
     System.OsPath.Ext
+    System.IO.Temp.OsPath
   hs-source-dirs:
     src
   build-depends:
@@ -92,8 +93,9 @@ library
     , directory-ospath-streaming
     , exceptions
     , filepath >= 1.4 && < 1.5
-    , text
     , stm
+    , temporary
+    , text
 
 executable stackage-tester
   import: ghc-options
