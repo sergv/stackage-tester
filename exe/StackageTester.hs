@@ -5,6 +5,7 @@
 -- Maintainer: serg.foo@gmail.com
 
 {-# LANGUAGE ApplicativeDo     #-}
+{-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE DerivingVia       #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -27,6 +28,10 @@ import Data.ByteString.Char8 qualified as C8
 import Data.Filesystem
 import Data.Foldable
 import Data.List.NonEmpty (NonEmpty(..))
+import Data.Lock (Lock)
+import Data.Lock qualified as Lock
+import Data.Set (Set)
+import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
@@ -55,6 +60,7 @@ import Test.Tasty.Runners qualified as Tasty
 data Config = Config
   { cfgCabalConfigFile       :: !OsPath
   , cfgExtraCabalConfigFiles :: ![OsPath]
+  , cfgGhc                   :: String
   }
 
 parseConfig :: Parser Config
@@ -68,6 +74,11 @@ parseConfig = do
     long "extra-cabal-config" <>
     metavar "FILE" <>
     help "Path to cabal.config with auxiliary build options to take effect during builds"
+
+  cfgGhc <- strOption $
+    long "with-ghc" <>
+    metavar "PATH" <>
+    help "ghc executable to use"
 
   pure Config{..}
 
@@ -178,8 +189,11 @@ main = do
     unless exists $
       die $ renderString $ "Extra cabal config file does not exist:" <+> ppShow path
 
+  lock <- Lock.new
+
   withDirs fcfgLogsDir $ \dirs -> do
-    let allTests = testGroup "Tests" $ map (mkTest dirs fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs'
+    let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs'
+
     case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
       Nothing  ->
         die "No ingredients agreed to run. Something is wrong either with your ingredient set or the options."
@@ -245,15 +259,16 @@ cabalBuildFlags =
   , "--remote-build-reporting=none"
   ]
 
-mkTest :: HasCallStack => DirConfig -> Config -> Package -> TestTree
+mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Package -> TestTree
 mkTest
+  buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles}
+  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhc}
   pkg =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
 
-    withSystemTempDirectory ([osp|workdir-|] <> fullPkgName') $ \tmpDir -> do
+    withSystemTempDirectory ([osp|workdir-|] <> fullPkgName') $ \tmpDir -> (`finally` renameDirectory tmpDir (tmpDir <> [osp|--tmp|])) $ do
 
       let pkgDir :: OsPath
           pkgDir = tmpDir </> fullPkgName'
@@ -270,6 +285,35 @@ mkTest
 
       pkgDir' <- OsPath.decodeUtf pkgDir
 
+      Lock.withAcquired buildDepsLock $ do
+        step "Build (--only-deps)"
+        let buildLog :: OsPath
+            buildLog = [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
+
+            buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
+
+        mkCabalProjectLocal fullPkgNameText (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
+
+        (`finally` removeFileIfExists buildLogTmp) $
+          withFile buildLogTmp WriteMode $ \buildLogH ->
+            runProc buildLogH (Just pkgDir')
+              "cabal"
+              (["build"] ++ cabalBuildFlags ++ ["-w", cfgGhc, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
+              (do
+                firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
+                unless (firstLine == "Up to date") $ do
+                  renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
+              (\cmd exitCode -> do
+                let dest = dcBuildLogsFailedDir </> buildLog
+                renameFile buildLogTmp dest
+                output <- T.decodeUtf8 <$> readFile' dest
+                pure $ ppDictHeader ("Build of dependencies of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                  [ "Logs location" :-> ppShow dest
+                  , "Command"       --> show cmd
+                  , "Directory"     --> pkgDir'
+                  , "Output"        --> output
+                  ])
+
       do
         step "Build"
         let buildLog :: OsPath
@@ -283,19 +327,25 @@ mkTest
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir')
               "cabal"
-              (["build"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all", "-j2"])
+              (["build"] ++ cabalBuildFlags ++ ["-w", cfgGhc, "--project-dir", ".", "all", "-j1", "-v3"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
                   renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
-              (\exitCode -> do
+              (\cmd exitCode -> do
                 let dest = dcBuildLogsFailedDir </> buildLog
                 renameFile buildLogTmp dest
                 output <- T.decodeUtf8 <$> readFile' dest
-                pure $
-                  "Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow buildLog ## pretty output)
+                pure $ ppDictHeader ("Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                  [ "Logs location" :-> ppShow dest
+                  , "Command"       --> show cmd
+                  , "Directory"     --> pkgDir'
+                  , "Output"        --> output
+                  ])
 
-      do
+      if pkgName pkg `S.member` ignoredPackages
+      then step "Tests skipped"
+      else do
         step "Test"
 
         let testLog :: OsPath
@@ -307,14 +357,19 @@ mkTest
           withFile testLogTmp WriteMode $ \testLogH ->
             runProc testLogH (Just pkgDir')
               "cabal"
-              (["test"] ++ cabalBuildFlags ++ ["--project-dir", ".", "all"])
+              (["test"] ++ cabalBuildFlags ++ ["-w", cfgGhc, "--project-dir", ".", "all"])
               (do
                 renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
-              (\exitCode -> do
+              (\cmd exitCode -> do
                 let dest = dcTestLogsFailedDir </> testLog
                 renameFile testLogTmp dest
                 output <- T.decodeUtf8 <$> readFile' dest
-                pure $ "Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode <> ", check logs at" <+> ppShow testLog ## pretty output)
+                pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                  [ "Logs location" :-> ppShow dest
+                  , "Command"       --> show cmd
+                  , "Directory"     --> pkgDir'
+                  , "Output"        --> output
+                  ])
 
       pure ()
   where
@@ -357,7 +412,7 @@ runProc
   -> String
   -> [String]
   -> IO ()
-  -> (Int -> IO (Doc ann))
+  -> ([String] -> Int -> IO (Doc ann))
   -> IO ()
 runProc out cwd cmd args onSuccess msgOnError = do
   let p = setStdin nullStream
@@ -374,7 +429,7 @@ runProc out cwd cmd args onSuccess msgOnError = do
     hClose out
     case exitCode of
       ExitFailure x ->
-        assertFailure . renderString =<< msgOnError x
+        assertFailure . renderString =<< msgOnError (cmd : args) x
       ExitSuccess   ->
         onSuccess
 
@@ -408,6 +463,14 @@ runProc' cwd cmd args msgOnError = do
       ExitFailure x ->
         assertFailure $ renderString $ msgOnError x stdOut stdErr
       ExitSuccess   -> pure ()
+
+ignoredPackages :: Set Text
+ignoredPackages = S.fromList
+  [ "haskoin-node"
+  , "hedis"
+  , "skews"
+  , "zeromq4-patterns"
+  ]
 
 debug :: Bool
 debug = False
