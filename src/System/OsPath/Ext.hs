@@ -13,6 +13,7 @@ module System.OsPath.Ext
   , textFromShortByteString
   , stripProperPrefix
   , pathToText
+  , pathFromText
   ) where
 
 import Data.ByteString.Short (ShortByteString)
@@ -33,14 +34,33 @@ pathToUtf8 =
   getPosixString . getOsString
 #endif
 
+pathFromUtf8 :: ShortByteString -> OsPath
+pathFromUtf8 =
+#ifdef mingw32_HOST_OS
+  OsString . WindowsString . _reconvertUtf8LEToUtf16
+#else
+  OsString . PosixString
+#endif
+
 pathToText :: OsPath -> Text
 pathToText = textFromShortByteString . pathToUtf8
+
+pathFromText :: Text -> OsPath
+pathFromText = pathFromUtf8 . textToShortByteString
 
 _reconvertUtf16LEToUtf8 :: ShortByteString -> ShortByteString
 _reconvertUtf16LEToUtf8 = textToShortByteString . TE.decodeUtf16LE . BSS.fromShort
 
+_reconvertUtf8LEToUtf16 :: ShortByteString -> ShortByteString
+_reconvertUtf8LEToUtf16 = BSS.toShort . TE.encodeUtf16LE . textFromShortByteString
+
 textToShortByteString :: Text -> ShortByteString
-textToShortByteString (T.Text (TA.ByteArray arr) _offset _len) = BSS.SBS arr
+textToShortByteString (T.Text arr offset len) = BSS.SBS arr'
+  where
+    !(TA.ByteArray arr') = TA.run $ do
+      dest <- TA.new len
+      TA.copyI len dest 0 arr offset
+      pure dest
 
 textFromShortByteString :: ShortByteString -> Text
 textFromShortByteString str@(BSS.SBS arr) = T.Text (TA.ByteArray arr) 0 (BSS.length str)

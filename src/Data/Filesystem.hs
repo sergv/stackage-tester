@@ -24,6 +24,8 @@ import Data.IORef
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.NBSem
 import GHC.Stack (HasCallStack)
+import Prettyprinter (Pretty(..))
+import Prettyprinter.Show
 import System.Directory.OsPath.FileType as Streaming
 import System.Directory.OsPath.Streaming as Streaming
 import System.OsPath
@@ -38,6 +40,11 @@ newtype AbsDir  = AbsDir  { unAbsDir  :: OsPath }
 newtype RelDir  = RelDir  { unRelDir  :: OsPath }
 newtype AbsFile = AbsFile { unAbsFile :: OsPath }
 newtype RelFile = RelFile { unRelFile :: OsPath }
+
+instance Pretty AbsDir  where pretty = ppShow . unAbsDir
+instance Pretty RelDir  where pretty = ppShow . unRelDir
+instance Pretty AbsFile where pretty = ppShow . unAbsFile
+instance Pretty RelFile where pretty = ppShow . unRelFile
 
 findAllCollect
   :: (RelFile -> Bool)
