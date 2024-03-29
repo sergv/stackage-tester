@@ -60,8 +60,9 @@ import Test.Tasty.Runners qualified as Tasty
 data Config = Config
   { cfgCabalConfigFile       :: !OsPath
   , cfgExtraCabalConfigFiles :: ![OsPath]
-  , cfgGhcExe                :: String
-  , cfgCabalExe              :: String
+  , cfgGhcExe                :: !String
+  , cfgCabalExe              :: !String
+  , cfgKeepTempWorkDir       :: !Bool
   }
 
 parseConfig :: Parser Config
@@ -87,6 +88,10 @@ parseConfig = do
     value "cabal" <>
     showDefault <>
     help "cabal executable to use"
+
+  cfgKeepTempWorkDir <- switch $
+    long "keep-temp-work-dir" <>
+    help "Don't remove working directories where packages are built for further inspection and debugging"
 
   pure Config{..}
 
@@ -267,17 +272,23 @@ cabalBuildFlags =
   , "--remote-build-reporting=none"
   ]
 
+createTmpDir :: OsString -> (OsPath -> IO a) -> IO a
+createTmpDir template k = do
+  tmpDir <- getCanonicalTemporaryDirectory
+  k =<< createTempDirectory tmpDir template
+
 mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Package -> TestTree
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe}
+  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir}
   pkg =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
 
     -- (`finally` renameDirectory tmpDir (tmpDir <> [osp|--tmp|]))
-    withSystemTempDirectory ([osp|workdir-|] <> fullPkgName') $ \tmpDir -> do
+    let tmpWorkDir = ([osp|workdir-|] <> fullPkgName')
+    (if cfgKeepTempWorkDir then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
       let pkgDir :: OsPath
           pkgDir = tmpDir </> fullPkgName'

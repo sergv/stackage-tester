@@ -8,6 +8,8 @@
 
 module System.IO.Temp.OsPath
   ( withSystemTempDirectory
+  , getCanonicalTemporaryDirectory
+  , createTempDirectory
   ) where
 
 -- import Control.Monad
@@ -25,3 +27,16 @@ withSystemTempDirectory
 withSystemTempDirectory template k = do
   template' <- decodeUtf template
   System.IO.Temp.withSystemTempDirectory template' (k <=< encodeUtf)
+
+createTempDirectory
+  :: OsPath -- ^ Parent directory to create the directory in
+  -> OsString -- ^ Directory name template
+  -> IO OsPath
+createTempDirectory parent template = do
+  parent'   <- decodeUtf parent
+  template' <- decodeUtf template
+  encodeUtf =<< System.IO.Temp.createTempDirectory parent' template'
+
+getCanonicalTemporaryDirectory :: IO OsPath
+getCanonicalTemporaryDirectory =
+  encodeUtf =<< System.IO.Temp.getCanonicalTemporaryDirectory
