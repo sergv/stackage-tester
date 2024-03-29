@@ -216,6 +216,11 @@ main = do
               ]
           pure ()
 
+  for_ [[osstr|hspec-discover|], [osstr|tasty-discover|]] $ \exe ->
+    findExecutable exe >>= \case
+      Nothing -> die $ renderString $ "Cannot find" <+> ppShow exe <+> "executable in PATH, it’s required for building some packages"
+      Just{}  -> pure ()
+
   let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
 
   pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
