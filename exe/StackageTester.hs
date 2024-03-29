@@ -30,6 +30,7 @@ import Data.Foldable
 import Data.List qualified as L
 import Data.Lock (Lock)
 import Data.Lock qualified as Lock
+import Data.Maybe
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Text (Text)
@@ -60,7 +61,7 @@ import Test.Tasty.Runners qualified as Tasty
 data Config = Config
   { cfgCabalConfigFile       :: !OsPath
   , cfgExtraCabalConfigFiles :: ![OsPath]
-  , cfgGhcExe                :: !String
+  , cfgGhcExe                :: !(Maybe String)
   , cfgCabalExe              :: !String
   , cfgKeepTempWorkDir       :: !Bool
   }
@@ -77,7 +78,7 @@ parseConfig = do
     metavar "FILE" <>
     help "Path to cabal.config with auxiliary build options to take effect during builds"
 
-  cfgGhcExe <- strOption $
+  cfgGhcExe <- optional $ strOption $
     long "with-ghc" <>
     metavar "PATH" <>
     help "ghc executable to use"
@@ -186,6 +187,35 @@ main = do
   FullConfig{fcfgSubconfig, fcfgLogsDir, fcfgLimitTests, fcfgTastyOpts} <-
     resolveRelativePaths =<< customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
 
+  findExecutable [osstr|ghc|] >>= \case
+    Nothing   -> die $ renderString "Cannot find ‘ghc’ executable in PATH, it’s required for alex tests."
+    Just path -> do
+      case cfgGhcExe fcfgSubconfig of
+        Nothing           -> pure ()
+        Just specifiedExe -> do
+          specifiedVersion <-
+            runProcCaptureOutput Nothing specifiedExe ["--version"] (\stdOut _stdErr -> pure stdOut)
+             (\_ stdOut stdErr ->
+               "Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":" ## vcat
+                 [ "Stdout:" ## pretty stdOut
+                 , "Stderr:" ## pretty stdErr
+                 ])
+          path' <- OsPath.decodeUtf path
+          defaultVersion <-
+            runProcCaptureOutput Nothing path' ["--version"] (\stdOut _stdErr -> pure stdOut)
+             (\_ stdOut stdErr ->
+               "Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":" ## vcat
+                 [ "Stdout:" ## pretty stdOut
+                 , "Stderr:" ## pretty stdErr
+                 ])
+          unless (specifiedVersion == defaultVersion) $
+            die $ renderString $ ppDictHeader
+              "Default ghc executable and specified ghc executable have different verisons"
+              [ "default ‘ghc’ version" :-> ppShow defaultVersion
+              , "‘--with-ghc’ version"  :-> ppShow specifiedVersion
+              ]
+          pure ()
+
   let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
 
   pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
@@ -258,19 +288,25 @@ parseCabalConfig = go [] . T.lines
           , pkgVersion = T.dropWhile (\c -> c == ' ' || c == '=') rest
           }
 
-cabalBuildFlags :: [String]
-cabalBuildFlags =
+data EnableTests = EnableTests | SkipTests
+
+cabalBuildFlags :: EnableTests -> [String]
+cabalBuildFlags enableTests =
   [ "--enable-shared"
   , "--enable-executable-dynamic"
   , "--disable-static"
   , "--disable-executable-static"
   , "--disable-profiling"
   , "--disable-documentation"
-  , "--enable-tests"
   , "--allow-newer"
   , "--enable-optimization"
   , "--remote-build-reporting=none"
-  ]
+  ] ++ testFlags
+  where
+    testFlags :: [String]
+    testFlags = case enableTests of
+      EnableTests -> ["--enable-tests"]
+      SkipTests   -> []
 
 createTmpDir :: OsString -> (OsPath -> IO a) -> IO a
 createTmpDir template k = do
@@ -286,7 +322,6 @@ mkTest
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
 
-    -- (`finally` renameDirectory tmpDir (tmpDir <> [osp|--tmp|]))
     let tmpWorkDir = ([osp|workdir-|] <> fullPkgName')
     (if cfgKeepTempWorkDir then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
@@ -307,6 +342,10 @@ mkTest
 
       mkCabalProjectLocal pkg (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
 
+      let runTests
+            | pkgName pkg `S.member` packagesSkipTest = SkipTests
+            | otherwise                               = EnableTests
+
       Lock.withAcquired buildDepsLock $ do
         step "Build (--only-deps)"
         let buildLog :: OsPath
@@ -318,7 +357,7 @@ mkTest
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
-              (["build"] ++ cabalBuildFlags ++ ["-w", cfgGhcExe, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
+              (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
@@ -345,7 +384,7 @@ mkTest
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
-              (["build"] ++ cabalBuildFlags ++ ["-w", cfgGhcExe, "--project-dir", ".", "all", "-j1"])
+              (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j1"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
@@ -361,33 +400,33 @@ mkTest
                   , "Output"        --> output
                   ])
 
-      if pkgName pkg `S.member` ignoredPackages
-      then step "Tests skipped"
-      else do
-        step "Test"
+      case runTests of
+        SkipTests   -> step "Tests skipped"
+        EnableTests -> do
+          step "Test"
 
-        let testLog :: OsPath
-            testLog = [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
+          let testLog :: OsPath
+              testLog = [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
 
-            testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
+              testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
 
-        (`finally` removeFileIfExists testLogTmp) $
-          withFile testLogTmp WriteMode $ \testLogH ->
-            runProc testLogH (Just pkgDir')
-              cfgCabalExe
-              (["test"] ++ cabalBuildFlags ++ ["-w", cfgGhcExe, "--project-dir", ".", "all"])
-              (do
-                renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
-              (\cmd exitCode -> do
-                let dest = dcTestLogsFailedDir </> testLog
-                renameFile testLogTmp dest
-                output <- T.decodeUtf8 <$> readFile' dest
-                pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                  [ "Logs location" :-> ppShow dest
-                  , "Command"       --> show cmd
-                  , "Directory"     --> pkgDir'
-                  , "Output"        --> output
-                  ])
+          (`finally` removeFileIfExists testLogTmp) $
+            withFile testLogTmp WriteMode $ \testLogH ->
+              runProc testLogH (Just pkgDir')
+                cfgCabalExe
+                (["test"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all"])
+                (do
+                  renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
+                (\cmd exitCode -> do
+                  let dest = dcTestLogsFailedDir </> testLog
+                  renameFile testLogTmp dest
+                  output <- T.decodeUtf8 <$> readFile' dest
+                  pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                    [ "Logs location" :-> ppShow dest
+                    , "Command"       --> show cmd
+                    , "Directory"     --> pkgDir'
+                    , "Output"        --> output
+                    ])
 
       pure ()
   where
@@ -460,6 +499,16 @@ runProc'
   -> (Int -> Text -> Text -> Doc ann)
   -> IO ()
 runProc' cwd cmd args msgOnError = do
+  runProcCaptureOutput cwd cmd args (\_ _ -> pure ()) msgOnError
+
+runProcCaptureOutput
+  :: Maybe FilePath
+  -> String
+  -> [String]
+  -> (Text -> Text -> IO a)
+  -> (Int -> Text -> Text -> Doc ann)
+  -> IO a
+runProcCaptureOutput cwd cmd args processOutput msgOnError = do
   let p = setStdin nullStream
         $ setStdout byteStringOutput
         $ setStderr byteStringOutput
@@ -482,14 +531,15 @@ runProc' cwd cmd args msgOnError = do
     case exitCode of
       ExitFailure x ->
         assertFailure $ renderString $ msgOnError x stdOut stdErr
-      ExitSuccess   -> pure ()
+      ExitSuccess   -> processOutput stdOut stdErr
 
-ignoredPackages :: Set Text
-ignoredPackages = S.fromList
+packagesSkipTest :: Set Text
+packagesSkipTest = S.fromList
   [ "haskoin-node"
   , "hedis"
   , "skews"
   , "zeromq4-patterns"
+  , "amqp" -- Tests are missing module in Hackage distribution and cannot be built
   ]
 
 debug :: Bool
