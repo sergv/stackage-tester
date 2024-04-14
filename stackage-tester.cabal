@@ -80,6 +80,7 @@ common ghc-options
 library
   import: ghc-options
   exposed-modules:
+    Data.Cabal
     Data.Filesystem
     Data.Lock
     Data.NBSem
@@ -88,12 +89,15 @@ library
   hs-source-dirs:
     src
   build-depends:
+    , Cabal >= 3.10
     , async
     , base >= 4.16
-    , bytestring
+    , bytestring >= 0.10.2
     , directory-ospath-streaming
     , exceptions
+    , file-io
     , filepath >= 1.4 && < 1.5
+    , mtl
     , prettyprinter
     , prettyprinter-combinators
     , stm
@@ -105,6 +109,7 @@ executable stackage-tester
   main-is:
     exe/StackageTester.hs
   build-depends:
+    , Cabal-syntax
     , async
     , base >= 4.16
     , bytestring
@@ -112,6 +117,7 @@ executable stackage-tester
     , directory
     , file-io
     , filepath >= 1.4 && < 1.5
+    , mtl
     , optparse-applicative
     -- , os-string
     , prettyprinter

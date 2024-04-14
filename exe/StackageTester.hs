@@ -22,9 +22,11 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
+import Control.Monad.Except
 import Data.Bifunctor
 import Data.Bitraversable
 import Data.ByteString.Char8 qualified as C8
+import Data.Cabal
 import Data.Filesystem
 import Data.Foldable
 import Data.List qualified as L
@@ -38,6 +40,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
+import Distribution.Types.UnqualComponentName
 import GHC.Stack
 import Options.Applicative
 import Prettyprinter hiding (dquote)
@@ -64,6 +67,7 @@ data Config = Config
   , cfgGhcExe                :: !(Maybe String)
   , cfgCabalExe              :: !String
   , cfgKeepTempWorkDir       :: !Bool
+  , cfgSkipDeps              :: !Bool
   }
 
 parseConfig :: Parser Config
@@ -94,13 +98,17 @@ parseConfig = do
     long "keep-temp-work-dir" <>
     help "Don't remove working directories where packages are built for further inspection and debugging"
 
+  cfgSkipDeps <- switch $
+    long "skip-deps" <>
+    help "Skip building dependencies, use with caution"
+
   pure Config{..}
 
 data FullConfig = FullConfig
-  { fcfgSubconfig       :: !Config
-  , fcfgLogsDir         :: !OsPath
-  , fcfgLimitTests      :: !(Maybe Int)
-  , fcfgTastyOpts       :: !Tasty.OptionSet
+  { fcfgSubconfig  :: !Config
+  , fcfgLogsDir    :: !OsPath
+  , fcfgLimitTests :: !(Maybe Int)
+  , fcfgTastyOpts  :: !Tasty.OptionSet
   }
 
 optsParser :: Parser Tasty.OptionSet -> Parser FullConfig
@@ -216,9 +224,9 @@ main = do
               ]
           pure ()
 
-  for_ [[osstr|hspec-discover|], [osstr|tasty-discover|]] $ \exe ->
+  for_ [([osstr|hspec-discover|], "hspec-discover"), ([osstr|tasty-discover|], "tasty-discover"), ([osstr|doctest-driver-gen|], "doctest-driver-gen"), ([osstr|htfpp|], "HTF")] $ \(exe, (pkg :: Doc ann)) ->
     findExecutable exe >>= \case
-      Nothing -> die $ renderString $ "Cannot find" <+> ppShow exe <+> "executable in PATH, it’s required for building some packages"
+      Nothing -> die $ renderString $ "Cannot find" <+> ppShow exe <+> "executable in PATH, it’s required for building some packages. Try ‘cabal install" <+> pkg <> "’"
       Just{}  -> pure ()
 
   let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
@@ -322,7 +330,7 @@ mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Package ->
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir}
+  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir, cfgSkipDeps}
   pkg =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
@@ -345,38 +353,39 @@ mkTest
 
       pkgDir' <- OsPath.decodeUtf pkgDir
 
-      mkCabalProjectLocal pkg (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
+      cabalFile <- mkCabalProjectLocal pkg (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
 
       let runTests
             | pkgName pkg `S.member` packagesSkipTest = SkipTests
             | otherwise                               = EnableTests
 
-      Lock.withAcquired buildDepsLock $ do
-        step "Build (--only-deps)"
-        let buildLog :: OsPath
-            buildLog = [osstr|build-deps-|] <> fullPkgName' <.> [osstr|log|]
+      unless cfgSkipDeps $
+        Lock.withAcquired buildDepsLock $ do
+          step "Build (--only-deps)"
+          let buildLog :: OsPath
+              buildLog = [osstr|build-deps-|] <> fullPkgName' <.> [osstr|log|]
 
-            buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
+              buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
 
-        (`finally` removeFileIfExists buildLogTmp) $
-          withFile buildLogTmp WriteMode $ \buildLogH ->
-            runProc buildLogH (Just pkgDir')
-              cfgCabalExe
-              (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
-              (do
-                firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
-                unless (firstLine == "Up to date") $ do
-                  renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
-              (\cmd exitCode -> do
-                let dest = dcBuildLogsFailedDir </> buildLog
-                renameFile buildLogTmp dest
-                output <- T.decodeUtf8 <$> readFile' dest
-                pure $ ppDictHeader ("Build of dependencies of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                  [ "Logs location" :-> ppShow dest
-                  , "Command"       --> show cmd
-                  , "Directory"     --> pkgDir'
-                  , "Output"        --> output
-                  ])
+          (`finally` removeFileIfExists buildLogTmp) $
+            withFile buildLogTmp WriteMode $ \buildLogH ->
+              runProc buildLogH (Just pkgDir')
+                cfgCabalExe
+                (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
+                (do
+                  firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
+                  unless (firstLine == "Up to date") $ do
+                    renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
+                (\cmd exitCode -> do
+                  let dest = dcBuildLogsFailedDir </> buildLog
+                  renameFile buildLogTmp dest
+                  output <- T.decodeUtf8 <$> readFile' dest
+                  pure $ ppDictHeader ("Build of dependencies of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                    [ "Logs location" :-> ppShow dest
+                    , "Command"       --> show cmd
+                    , "Directory"     --> pkgDir'
+                    , "Output"        --> output
+                    ])
 
       do
         step "Build"
@@ -410,28 +419,39 @@ mkTest
         EnableTests -> do
           step "Test"
 
-          let testLog :: OsPath
-              testLog = [osstr|test-|] <> fullPkgName' <.> [osstr|log|]
+          components <- either assertFailure pure =<< runExceptT (getCabalComponents (unAbsFile cabalFile))
 
-              testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
+          let tests :: [String]
+              tests = [ unUnqualComponentName name | (CTTestSuite, name) <- components ]
 
-          (`finally` removeFileIfExists testLogTmp) $
-            withFile testLogTmp WriteMode $ \testLogH ->
-              runProc testLogH (Just pkgDir')
-                cfgCabalExe
-                (["test"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all"])
-                (do
-                  renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
-                (\cmd exitCode -> do
-                  let dest = dcTestLogsFailedDir </> testLog
-                  renameFile testLogTmp dest
-                  output <- T.decodeUtf8 <$> readFile' dest
-                  pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                    [ "Logs location" :-> ppShow dest
-                    , "Command"       --> show cmd
-                    , "Directory"     --> pkgDir'
-                    , "Output"        --> output
-                    ])
+          forConcurrently_ tests $ \test -> do
+
+            (test' :: OsPath) <- OsPath.encodeUtf test
+
+            let testLog :: OsPath
+                testLog = [osstr|test-|] <> fullPkgName' <.> test' <.> [osstr|log|]
+
+                testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
+
+            (`finally` removeFileIfExists testLogTmp) $
+              withFile testLogTmp WriteMode $ \testLogH ->
+                runProc testLogH (Just pkgDir')
+                  cfgCabalExe
+                  (["exec", "--", cfgCabalExe, "run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", "."])
+                  -- On success
+                  (do
+                    renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
+                  -- On failure
+                  (\cmd exitCode -> do
+                    let dest = dcTestLogsFailedDir </> testLog
+                    renameFile testLogTmp dest
+                    output <- T.decodeUtf8 <$> readFile' dest
+                    pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                      [ "Logs location" :-> ppShow dest
+                      , "Command"       --> show cmd
+                      , "Directory"     --> pkgDir'
+                      , "Output"        --> output
+                      ])
 
       pure ()
   where
@@ -446,32 +466,31 @@ removeFileIfExists path = do
   when exists $
     removeFile path
 
-mkCabalProjectLocal :: Package -> AbsDir -> OsPath -> [OsPath] -> IO ()
+mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> OsPath -> [OsPath] -> IO AbsFile
 mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = do
   let importStr :: Text
       importStr = T.unlines $ map (\p -> "import: " <> pathToText p) $ cabalConfigFile : extraConfigs
 
   haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
-  cabalFile        <-
-    if haveCabalProject
-    then
-      pure Nothing
-    else do
-      toplevelFiles <- listDirectory $ unAbsDir pkgDir
-      -- cabalFiles <- findAllCollect ((== (pathFromText pkgName <.> [osstr|cabal|])) . unRelFile) $ pkgDir :| []
-      let cabalFile = pathFromText pkgName <.> [osstr|cabal|]
-      case L.find ((== cabalFile)) toplevelFiles of
-        Nothing -> error $ renderString $ "Could not locate cabal file for package" <+> pretty (getFullPkgName pkg) <+> "in its toplevel directory" <+> pretty pkgDir
-        Just x  -> pure $ Just $ AbsFile $ unAbsDir pkgDir </> x
+  cabalFile        <- do
+    toplevelFiles <- listDirectory $ unAbsDir pkgDir
+    -- cabalFiles <- findAllCollect ((== (pathFromText pkgName <.> [osstr|cabal|])) . unRelFile) $ pkgDir :| []
+    let cabalFile = pathFromText pkgName <.> [osstr|cabal|]
+    case L.find ((== cabalFile)) toplevelFiles of
+      Nothing -> error $ renderString $ "Could not locate cabal file for package" <+> pretty (getFullPkgName pkg) <+> "in its toplevel directory" <+> pretty pkgDir
+      Just x  -> pure $ AbsFile $ unAbsDir pkgDir </> x
 
   writeFile' (unAbsDir pkgDir </> [osp|cabal.project.local|]) $ T.encodeUtf8 $ T.unlines $
     importStr :
-    case cabalFile of
-      Nothing -> []
-      Just x  -> "packages:" : ["  " <> pathToText (unAbsFile x)]
+    case (haveCabalProject, cabalFile) of
+      (True,  _) -> []
+      (False, x) -> "packages:" : ["  " <> pathToText (unAbsFile x)]
+
+  pure cabalFile
 
 runProc
-  :: Handle
+  :: HasCallStack
+  => Handle
   -> Maybe FilePath
   -> String
   -> [String]
@@ -507,7 +526,8 @@ runProc' cwd cmd args msgOnError = do
   runProcCaptureOutput cwd cmd args (\_ _ -> pure ()) msgOnError
 
 runProcCaptureOutput
-  :: Maybe FilePath
+  :: HasCallStack
+  => Maybe FilePath
   -> String
   -> [String]
   -> (Text -> Text -> IO a)
@@ -545,6 +565,7 @@ packagesSkipTest = S.fromList
   , "skews"
   , "zeromq4-patterns"
   , "amqp" -- Tests are missing module in Hackage distribution and cannot be built
+  , "cabal-install" -- Depends on 'Cabal-described' package which is not on Hackage
   ]
 
 debug :: Bool
