@@ -32,7 +32,6 @@ import Data.Foldable
 import Data.List qualified as L
 import Data.Lock (Lock)
 import Data.Lock qualified as Lock
-import Data.Maybe
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Text (Text)
@@ -336,6 +335,9 @@ mkTest
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
 
     let tmpWorkDir = ([osp|workdir-|] <> fullPkgName')
+        ghcArg     = case cfgGhcExe of
+          Nothing -> []
+          Just x  -> ["-w", x]
     (if cfgKeepTempWorkDir then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
       let pkgDir :: OsPath
@@ -371,7 +373,7 @@ mkTest
             withFile buildLogTmp WriteMode $ \buildLogH ->
               runProc buildLogH (Just pkgDir')
                 cfgCabalExe
-                (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j4", "--only-dependencies"])
+                (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j4", "--only-dependencies"])
                 (do
                   firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                   unless (firstLine == "Up to date") $ do
@@ -398,7 +400,7 @@ mkTest
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
-              (["build"] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", ".", "all", "-j1"])
+              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j1"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
@@ -437,7 +439,7 @@ mkTest
               withFile testLogTmp WriteMode $ \testLogH ->
                 runProc testLogH (Just pkgDir')
                   cfgCabalExe
-                  (["exec", "--", cfgCabalExe, "run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ["-w", fromMaybe "ghc" cfgGhcExe, "--project-dir", "."])
+                  (["exec", "--", cfgCabalExe, "run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
                   -- On success
                   (do
                     renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
