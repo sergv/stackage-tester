@@ -439,7 +439,7 @@ mkTest
               withFile testLogTmp WriteMode $ \testLogH ->
                 runProc testLogH (Just pkgDir')
                   cfgCabalExe
-                  (["exec", "--", cfgCabalExe, "run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
+                  (["exec", "--", cfgCabalExe, "test", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
                   -- On success
                   (do
                     renameFile testLogTmp (dcTestLogsSuccessDir </> testLog))
