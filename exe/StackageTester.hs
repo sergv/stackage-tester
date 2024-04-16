@@ -39,7 +39,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
-import Distribution.Types.Dependency
 import Distribution.Types.UnqualComponentName
 import GHC.Stack
 import Options.Applicative
@@ -313,6 +312,8 @@ cabalBuildFlags enableTests =
   , "--allow-newer"
   , "--enable-optimization"
   , "--remote-build-reporting=none"
+  , "--enable-executable-stripping"
+  , "--enable-library-stripping"
   ] ++ testFlags
   where
     testFlags :: [String]
@@ -400,7 +401,8 @@ mkTest
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
-              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j1"])
+              -- Environment is crucial to make doctests work.
+              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j1", "--write-ghc-environment-files=always"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
@@ -423,14 +425,13 @@ mkTest
 
           components <- either assertFailure pure =<< runExceptT (getCabalComponents (unAbsFile cabalFile))
 
-          let tests :: [(String, Bool)]
+          let tests :: [String]
               tests =
-                [ (unUnqualComponentName name, hasDoctest)
-                | (CTTestSuite, name, deps) <- components
-                , let hasDoctest = any(("doctest" ==) . depPkgName) deps
+                [ unUnqualComponentName name
+                | (CTTestSuite, name) <- components
                 ]
 
-          for_ tests $ \(test, hasDoctest) -> do
+          for_ tests $ \test -> do
 
             (test' :: OsPath) <- OsPath.encodeUtf test
 
@@ -454,28 +455,12 @@ mkTest
                     ]
 
             (`finally` removeFileIfExists testLogTmp) $
-              withFile testLogTmp WriteMode $ \testLogH -> do
-                let target = "test:" ++ test
-                if hasDoctest
-                then do
-                  exePath <- runProcCaptureOutput (Just pkgDir') cfgCabalExe ["list-bin", target] (\stdOut _stdErr -> pure stdOut)
-                    (reportErrorWithStdoutAndStderr ("Failed to locate executable for test target" <+> pretty target <> ":"))
-
-                  runProc testLogH (Just pkgDir')
-                    cfgCabalExe
-                    -- Don't let cabal rebuild executable via ‘cabal test’ or ‘cabal run’ since
-                    -- from under ‘cabal exec’ it will add more package dependencies that
-                    -- is actually needed. Those dependencies will not be found when executable
-                    -- will run thus failing the test.
-                    ["exec", "--allow-newer", "--enable-tests", "--project-dir", ".", "--", T.unpack $ T.strip exePath]
-                    onSuccess
-                    onFailure
-                else
-                  runProc testLogH (Just pkgDir')
-                    cfgCabalExe
-                    (["run", target] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
-                    onSuccess
-                    onFailure
+              withFile testLogTmp WriteMode $ \testLogH ->
+                runProc testLogH (Just pkgDir')
+                  cfgCabalExe
+                  (["run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
+                  onSuccess
+                  onFailure
 
       pure ()
   where

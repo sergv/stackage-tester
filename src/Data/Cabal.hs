@@ -37,7 +37,6 @@ import Distribution.PackageDescription.Parsec (runParseResult, parseGenericPacka
 import Distribution.Parsec.Error (showPError)
 import Distribution.System (buildPlatform)
 import Distribution.Types.Benchmark
-import Distribution.Types.BuildInfo
 import Distribution.Types.ComponentRequestedSpec (ComponentRequestedSpec(..))
 import Distribution.Types.Executable
 import Distribution.Types.ForeignLib
@@ -66,22 +65,22 @@ _componentTypePrefix = \case
 -- | Gather files and modules that constitute each component.
 getComponents
   :: PackageDescription
-  -> [(ComponentType, UnqualComponentName, [Dependency])]
+  -> [(ComponentType, UnqualComponentName)]
 getComponents pkgDesc =
-  [ (CTLibrary, name, targetBuildDepends $ libBuildInfo lib)
+  [ (CTLibrary, name)
   | lib <- allLibraries pkgDesc
   , let name = fromMaybe (packageNameToUnqualComponentName packageName) $ libraryNameString $ libName lib
   ] ++
-  [ (CTForeignLibrary, foreignLibName flib, targetBuildDepends $ foreignLibBuildInfo flib)
+  [ (CTForeignLibrary, foreignLibName flib)
   | flib <- foreignLibs pkgDesc
   ] ++
-  [ (CTExecutable, exeName exe, targetBuildDepends $ buildInfo exe)
+  [ (CTExecutable, exeName exe)
   | exe <- executables pkgDesc
   ] ++
-  [ (CTTestSuite, testName tst, targetBuildDepends $ testBuildInfo tst)
+  [ (CTTestSuite, testName tst)
   | tst <- testSuites pkgDesc
   ] ++
-  [ (CTBenchmark, benchmarkName tst, targetBuildDepends $ benchmarkBuildInfo tst)
+  [ (CTBenchmark, benchmarkName tst)
   | tst <- benchmarks pkgDesc
   ]
   where
@@ -91,7 +90,7 @@ getComponents pkgDesc =
 getCabalComponents
   :: (MonadError String m, MonadIO m, MonadThrow m)
   => OsPath
-  -> m [(ComponentType, UnqualComponentName, [Dependency])]
+  -> m [(ComponentType, UnqualComponentName)]
 getCabalComponents configFile = do
   genericDesc <- readGenericPkgDescr configFile
   case getConcretePackageDescription genericDesc of
