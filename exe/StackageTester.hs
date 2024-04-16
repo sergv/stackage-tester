@@ -362,9 +362,9 @@ mkTest
             | pkgName pkg `S.member` packagesSkipTest = SkipTests
             | otherwise                               = EnableTests
 
-      unless cfgSkipDeps $
+      unless cfgSkipDeps $ do
+        step "Build (--only-deps)"
         Lock.withAcquired buildDepsLock $ do
-          step "Build (--only-deps)"
           let buildLog :: OsPath
               buildLog = [osstr|build-deps-|] <> fullPkgName' <.> [osstr|log|]
 
