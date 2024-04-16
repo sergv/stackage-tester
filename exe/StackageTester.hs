@@ -183,6 +183,13 @@ withDirs logsDir k = do
     , dcTestLogsFailedDir
     }
 
+reportErrorWithStdoutAndStderr :: Doc ann -> (Int -> Text -> Text -> Doc ann)
+reportErrorWithStdoutAndStderr msg _ stdOut stdErr =
+  msg ## vcat
+    [ "Stdout:" ## pretty stdOut
+    , "Stderr:" ## pretty stdErr
+    ]
+
 main :: IO ()
 main = do
 
@@ -202,19 +209,11 @@ main = do
         Just specifiedExe -> do
           specifiedVersion <-
             runProcCaptureOutput Nothing specifiedExe ["--version"] (\stdOut _stdErr -> pure stdOut)
-             (\_ stdOut stdErr ->
-               "Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":" ## vcat
-                 [ "Stdout:" ## pretty stdOut
-                 , "Stderr:" ## pretty stdErr
-                 ])
+              (reportErrorWithStdoutAndStderr ("Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":"))
           path' <- OsPath.decodeUtf path
           defaultVersion <-
             runProcCaptureOutput Nothing path' ["--version"] (\stdOut _stdErr -> pure stdOut)
-             (\_ stdOut stdErr ->
-               "Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":" ## vcat
-                 [ "Stdout:" ## pretty stdOut
-                 , "Stderr:" ## pretty stdErr
-                 ])
+              (reportErrorWithStdoutAndStderr ("Failed to get version of specified ghc executable" <+> pretty specifiedExe <> ":"))
           unless (specifiedVersion == defaultVersion) $
             die $ renderString $ ppDictHeader
               "Default ghc executable and specified ghc executable have different verisons"
