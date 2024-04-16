@@ -29,20 +29,21 @@ import System.File.OsPath
 import System.OsPath
 
 import Distribution.Compiler (AbiTag(NoAbiTag), CompilerFlavor(GHC), CompilerId(CompilerId), CompilerInfo, unknownCompilerInfo)
-import Distribution.Package (pkgName, Dependency(..))
 import Distribution.Package (PackageName)
-import Distribution.PackageDescription (GenericPackageDescription, PackageDescription(..), exeName)
-import Distribution.PackageDescription (allLibraries, libName)
-import Distribution.PackageDescription (mkFlagAssignment)
+import Distribution.Package (pkgName, Dependency(..))
+import Distribution.PackageDescription (GenericPackageDescription, PackageDescription(..), allLibraries, mkFlagAssignment)
 import Distribution.PackageDescription.Configuration (finalizePD)
 import Distribution.PackageDescription.Parsec (runParseResult, parseGenericPackageDescription)
 import Distribution.Parsec.Error (showPError)
 import Distribution.System (buildPlatform)
-import Distribution.Types.Benchmark (Benchmark(benchmarkName))
+import Distribution.Types.Benchmark
+import Distribution.Types.BuildInfo
 import Distribution.Types.ComponentRequestedSpec (ComponentRequestedSpec(..))
-import Distribution.Types.ForeignLib (ForeignLib(foreignLibName))
+import Distribution.Types.Executable
+import Distribution.Types.ForeignLib
+import Distribution.Types.Library
 import Distribution.Types.LibraryName (libraryNameString)
-import Distribution.Types.TestSuite (TestSuite(testName))
+import Distribution.Types.TestSuite
 import Distribution.Types.UnqualComponentName
 import Distribution.Version qualified as Cabal
 
@@ -65,22 +66,22 @@ _componentTypePrefix = \case
 -- | Gather files and modules that constitute each component.
 getComponents
   :: PackageDescription
-  -> [(ComponentType, UnqualComponentName)]
+  -> [(ComponentType, UnqualComponentName, [Dependency])]
 getComponents pkgDesc =
-  [ (CTLibrary, name)
+  [ (CTLibrary, name, targetBuildDepends $ libBuildInfo lib)
   | lib <- allLibraries pkgDesc
   , let name = fromMaybe (packageNameToUnqualComponentName packageName) $ libraryNameString $ libName lib
   ] ++
-  [ (CTForeignLibrary, foreignLibName flib)
+  [ (CTForeignLibrary, foreignLibName flib, targetBuildDepends $ foreignLibBuildInfo flib)
   | flib <- foreignLibs pkgDesc
   ] ++
-  [ (CTExecutable, exeName exe)
+  [ (CTExecutable, exeName exe, targetBuildDepends $ buildInfo exe)
   | exe <- executables pkgDesc
   ] ++
-  [ (CTTestSuite, testName tst)
+  [ (CTTestSuite, testName tst, targetBuildDepends $ testBuildInfo tst)
   | tst <- testSuites pkgDesc
   ] ++
-  [ (CTBenchmark, benchmarkName tst)
+  [ (CTBenchmark, benchmarkName tst, targetBuildDepends $ benchmarkBuildInfo tst)
   | tst <- benchmarks pkgDesc
   ]
   where
@@ -90,7 +91,7 @@ getComponents pkgDesc =
 getCabalComponents
   :: (MonadError String m, MonadIO m, MonadThrow m)
   => OsPath
-  -> m [(ComponentType, UnqualComponentName)]
+  -> m [(ComponentType, UnqualComponentName, [Dependency])]
 getCabalComponents configFile = do
   genericDesc <- readGenericPkgDescr configFile
   case getConcretePackageDescription genericDesc of
