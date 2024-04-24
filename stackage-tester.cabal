@@ -81,6 +81,7 @@ library
   import: ghc-options
   exposed-modules:
     Data.Cabal
+    Data.CabalConfig
     Data.Filesystem
     Data.Lock
     Data.NBSem
@@ -96,10 +97,11 @@ library
     , directory-ospath-streaming
     , exceptions
     , file-io
-    , filepath >= 1.4 && < 1.5
+    , filepath >= 1.5
     , mtl
     , prettyprinter
     , prettyprinter-combinators
+    , os-string
     , stm
     , temporary
     , text
@@ -116,10 +118,10 @@ executable stackage-tester
     , containers
     , directory
     , file-io
-    , filepath >= 1.4 && < 1.5
+    , filepath >= 1.5
     , mtl
     , optparse-applicative
-    -- , os-string
+    , os-string
     , prettyprinter
     , prettyprinter-combinators
     , stackage-tester

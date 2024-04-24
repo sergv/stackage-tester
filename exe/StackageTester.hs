@@ -27,6 +27,8 @@ import Data.Bifunctor
 import Data.Bitraversable
 import Data.ByteString.Char8 qualified as C8
 import Data.Cabal
+import Data.CabalConfig
+import Data.Coerce (coerce)
 import Data.Filesystem
 import Data.Foldable
 import Data.List qualified as L
@@ -44,7 +46,6 @@ import GHC.Stack
 import Options.Applicative
 import Prettyprinter hiding (dquote)
 import Prettyprinter.Combinators
-import Prettyprinter.Generics
 import Prettyprinter.Show
 import System.Directory.OsPath
 import System.Exit
@@ -53,7 +54,7 @@ import System.IO (IOMode(..), Handle, hClose)
 import System.IO.Temp.OsPath
 import System.OsPath as OsPath
 import System.OsPath.Ext
-import System.OsString as OsString
+import System.OsString (osstr)
 import System.Process.Typed
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -61,7 +62,7 @@ import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
 data Config = Config
-  { cfgCabalConfigFile       :: !OsPath
+  { cfgCabalConfigFile       :: !RawCabalConfig
   , cfgExtraCabalConfigFiles :: ![OsPath]
   , cfgGhcExe                :: !(Maybe String)
   , cfgCabalExe              :: !String
@@ -71,10 +72,10 @@ data Config = Config
 
 parseConfig :: Parser Config
 parseConfig = do
-  cfgCabalConfigFile <- option (eitherReader (bimap show id . OsPath.encodeUtf)) $
+  cfgCabalConfigFile <- option (eitherReader (bimap show RawCabalConfig . OsPath.encodeUtf)) $
     long "cabal-config-main" <>
     metavar "FILE" <>
-    help "Path to cabal.config with constraints; formatted like https://www.stackage.org/nightly-2023-10-04/cabal.config"
+    help "Path to cabal.config with version constraints; formatted like https://www.stackage.org/nightly-2023-10-04/cabal.config"
 
   cfgExtraCabalConfigFiles <- many $ option (eitherReader (bimap show id . OsPath.encodeUtf)) $
     long "extra-cabal-config" <>
@@ -147,7 +148,7 @@ resolveRelativePaths fcfg@FullConfig{fcfgSubconfig, fcfgLogsDir} = do
   where
     resolveRelativePaths' :: Config -> IO Config
     resolveRelativePaths' cfg@Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles} = do
-      cfgCabalConfigFile'       <- makeAbsolute cfgCabalConfigFile
+      cfgCabalConfigFile'       <- coerce makeAbsolute cfgCabalConfigFile
       cfgExtraCabalConfigFiles' <- traverse makeAbsolute cfgExtraCabalConfigFiles
       pure cfg
         { cfgCabalConfigFile       = cfgCabalConfigFile'
@@ -229,7 +230,7 @@ main = do
 
   let cabalConfigPath = cfgCabalConfigFile fcfgSubconfig
 
-  pkgs <- parseCabalConfig . T.decodeUtf8 <$> readFile' cabalConfigPath
+  pkgs <- parseCabalConfigIO cabalConfigPath
 
   let pkgs' = filter ((/= "installed") . pkgVersion) pkgs
 
@@ -245,27 +246,19 @@ main = do
 
   lock <- Lock.new
 
-  withDirs fcfgLogsDir $ \dirs -> do
-    let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig) $ maybe id take fcfgLimitTests pkgs'
+  withFullyPinnedCabalConfig pkgs' $ \fullyPinnedConfigPath -> do
 
-    case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
-      Nothing  ->
-        die "No ingredients agreed to run. Something is wrong either with your ingredient set or the options."
-      Just act -> do
-        ok <- act
-        if ok then exitSuccess else exitFailure
+    withDirs fcfgLogsDir $ \dirs -> do
+      let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig fullyPinnedConfigPath) $ maybe id take fcfgLimitTests pkgs'
 
-    pure ()
+      case Tasty.tryIngredients ingredients fcfgTastyOpts allTests of
+        Nothing  ->
+          die "No ingredients agreed to run. Something is wrong either with your ingredient set or the options."
+        Just act -> do
+          ok <- act
+          if ok then exitSuccess else exitFailure
 
-data Package = Package
-  { pkgName    :: !Text
-  , pkgVersion :: !Text
-  }
-  deriving stock (Show, Generic)
-  deriving Pretty via PPGeneric Package
-
-getFullPkgName :: Package -> Text
-getFullPkgName Package{pkgName, pkgVersion} = pkgName <> "-" <> pkgVersion
+      pure ()
 
 -- data LocatedDoc = LocatedDoc
 --   { ldMsg       :: !(Doc Void)
@@ -274,30 +267,6 @@ getFullPkgName Package{pkgName, pkgVersion} = pkgName <> "-" <> pkgVersion
 --
 -- instance Pretty LocatedDoc where
 --   pretty (LocatedDoc msg stack) = vacuous msg ## ppCallStack stack
-
--- parseCabalConfig :: forall m. (HasCallStack, MonadError LocatedDoc m) => Text -> m [Package]
-parseCabalConfig :: Text -> [Package]
-parseCabalConfig = go [] . T.lines
-  where
-    go :: [Package] -> [Text] -> [Package]
-    go acc []
-      = reverse acc
-    go acc (x : xs)
-      | Just x' <- T.stripPrefix "constraints:" x
-      = go' acc (x' : xs)
-      | otherwise
-      = go acc xs
-
-    go' :: [Package] -> [Text] -> [Package]
-    go' acc []       = reverse acc
-    go' acc (x : xs) = go' (pkg : acc) xs
-      where
-        x'              = T.dropWhileEnd (== ',') $ T.strip x
-        (pkgName, rest) = T.span (/= ' ') x'
-        pkg             = Package
-          { pkgName
-          , pkgVersion = T.dropWhile (\c -> c == ' ' || c == '=') rest
-          }
 
 data EnableTests = EnableTests | SkipTests
 
@@ -326,11 +295,12 @@ createTmpDir template k = do
   tmpDir <- getCanonicalTemporaryDirectory
   k =<< createTempDirectory tmpDir template
 
-mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Package -> TestTree
+mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> FullyPinnedCabalConfig -> Package -> TestTree
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgCabalConfigFile, cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir, cfgSkipDeps}
+  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir, cfgSkipDeps}
+  cabalConfigPath
   pkg =
   testCaseSteps fullPkgName $ \step -> do
     (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
@@ -356,7 +326,7 @@ mkTest
 
       pkgDir' <- OsPath.decodeUtf pkgDir
 
-      cabalFile <- mkCabalProjectLocal pkg (AbsDir pkgDir) cfgCabalConfigFile cfgExtraCabalConfigFiles
+      cabalFile <- mkCabalProjectLocal pkg (AbsDir pkgDir) cabalConfigPath cfgExtraCabalConfigFiles
 
       let runTests
             | pkgName pkg `S.member` packagesSkipTest = SkipTests
@@ -465,9 +435,7 @@ mkTest
       pure ()
   where
     fullPkgName :: String
-    fullPkgName = T.unpack fullPkgNameText
-    fullPkgNameText :: Text
-    fullPkgNameText = getFullPkgName pkg
+    fullPkgName = T.unpack $ getFullPkgName pkg
 
 removeFileIfExists :: OsPath -> IO ()
 removeFileIfExists path = do
@@ -475,10 +443,13 @@ removeFileIfExists path = do
   when exists $
     removeFile path
 
-mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> OsPath -> [OsPath] -> IO AbsFile
+mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> FullyPinnedCabalConfig -> [OsPath] -> IO AbsFile
 mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = do
   let importStr :: Text
-      importStr = T.unlines $ map (\p -> "import: " <> pathToText p) $ cabalConfigFile : extraConfigs
+      importStr
+        = T.unlines
+        $ map (\p -> "import: " <> pathToText p)
+        $ unFullyPinnedCabalConfig cabalConfigFile : extraConfigs
 
   haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
   cabalFile        <- do

@@ -10,14 +10,29 @@ module System.IO.Temp.OsPath
   ( withSystemTempDirectory
   , getCanonicalTemporaryDirectory
   , createTempDirectory
+  , withSystemTempFileContents
   ) where
 
 -- import Control.Monad
 import Control.Monad
 import Control.Monad.Catch qualified as MC
 import Control.Monad.IO.Class
+import System.IO (Handle, hClose)
 import System.IO.Temp qualified
 import System.OsPath
+
+withSystemTempFileContents
+  :: (MonadIO m, MC.MonadMask m)
+  => OsString
+  -> (Handle -> m ())   -- ^ Initialize file.
+  -> (OsPath -> m a) -- ^ Continue with file initialized and handle closed.
+  -> m a
+withSystemTempFileContents template initialise k = do
+  template' <- decodeUtf template
+  System.IO.Temp.withSystemTempFile template' $ \path h -> do
+    initialise h
+    liftIO $ hClose h
+    k =<< encodeUtf path
 
 withSystemTempDirectory
   :: (MonadIO m, MC.MonadMask m)
