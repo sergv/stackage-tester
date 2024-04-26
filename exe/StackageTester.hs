@@ -246,7 +246,7 @@ main = do
 
   lock <- Lock.new
 
-  withFullyPinnedCabalConfig (cfgKeepTempArtifacts fcfgSubconfig) pkgs' $ \fullyPinnedConfigPath -> do
+  withFullyPinnedCabalConfig (cfgKeepTempArtifacts fcfgSubconfig) pkgs $ \fullyPinnedConfigPath -> do
 
     withDirs fcfgLogsDir $ \dirs -> do
       let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig fullyPinnedConfigPath) $ maybe id take fcfgLimitTests pkgs'

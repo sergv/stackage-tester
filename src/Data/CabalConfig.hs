@@ -72,7 +72,7 @@ withFullyPinnedCabalConfig keepTempFile pkgs k =
       for_ pkgs $ \Package{pkgName, pkgVersion} -> do
         let version
               | pkgVersion == "installed"
-              = pkgVersion
+              = " " <> pkgVersion
               | otherwise
               = " ==" <> pkgVersion
         T.hPutStrLn h $ "  , any." <> pkgName <> version
