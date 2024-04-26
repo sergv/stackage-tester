@@ -94,6 +94,7 @@ library
     , async
     , base >= 4.16
     , bytestring >= 0.10.2
+    , directory
     , directory-ospath-streaming
     , exceptions
     , file-io

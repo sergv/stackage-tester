@@ -59,11 +59,12 @@ instance Pretty FullyPinnedCabalConfig where
 
 withFullyPinnedCabalConfig
   :: forall m a. (MonadIO m, MonadMask m)
-  => [Package]
+  => Bool
+  -> [Package]
   -> (FullyPinnedCabalConfig -> m a)
   -> m a
-withFullyPinnedCabalConfig pkgs k =
-  withSystemTempFileContents [osstr|fully-pinned-cabal.config|] (liftIO . initialise) (k . FullyPinnedCabalConfig)
+withFullyPinnedCabalConfig keepTempFile pkgs k =
+  (if keepTempFile then createTmpFile else withSystemTempFileContents) [osstr|fully-pinned-cabal.config|] (liftIO . initialise) (k . FullyPinnedCabalConfig)
   where
     initialise :: Handle -> IO ()
     initialise h = do

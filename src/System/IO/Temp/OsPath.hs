@@ -11,18 +11,20 @@ module System.IO.Temp.OsPath
   , getCanonicalTemporaryDirectory
   , createTempDirectory
   , withSystemTempFileContents
+  , createTmpDir
+  , createTmpFile
   ) where
 
--- import Control.Monad
 import Control.Monad
-import Control.Monad.Catch qualified as MC
+import Control.Monad.Catch
 import Control.Monad.IO.Class
-import System.IO (Handle, hClose)
+import System.Directory.OsPath (removeFile)
+import System.IO (Handle, hClose, openBinaryTempFile)
 import System.IO.Temp qualified
 import System.OsPath
 
 withSystemTempFileContents
-  :: (MonadIO m, MC.MonadMask m)
+  :: (MonadIO m, MonadMask m)
   => OsString
   -> (Handle -> m ())   -- ^ Initialize file.
   -> (OsPath -> m a) -- ^ Continue with file initialized and handle closed.
@@ -35,7 +37,7 @@ withSystemTempFileContents template initialise k = do
     k =<< encodeUtf path
 
 withSystemTempDirectory
-  :: (MonadIO m, MC.MonadMask m)
+  :: (MonadIO m, MonadMask m)
   => OsString        -- ^ Directory name template
   -> (OsPath -> m a) -- ^ Callback that can use the directory
   -> m a
@@ -52,6 +54,34 @@ createTempDirectory parent template = do
   template' <- decodeUtf template
   encodeUtf =<< System.IO.Temp.createTempDirectory parent' template'
 
-getCanonicalTemporaryDirectory :: IO OsPath
+createTempFile
+  :: OsPath -- ^ Parent directory to create the directory in
+  -> OsString -- ^ Directory name template
+  -> IO (OsPath, Handle)
+createTempFile parent template = do
+  parent'   <- decodeUtf parent
+  template' <- decodeUtf template
+  (path, h) <- openBinaryTempFile parent' template'
+  (, h) <$> encodeUtf path
+
+getCanonicalTemporaryDirectory :: (MonadThrow m, MonadIO m) => m OsPath
 getCanonicalTemporaryDirectory =
-  encodeUtf =<< System.IO.Temp.getCanonicalTemporaryDirectory
+  encodeUtf =<< liftIO System.IO.Temp.getCanonicalTemporaryDirectory
+
+createTmpDir :: OsString -> (OsPath -> IO a) -> IO a
+createTmpDir template k = do
+  tmpDir <- getCanonicalTemporaryDirectory
+  k =<< createTempDirectory tmpDir template
+
+createTmpFile
+  :: (MonadIO m, MonadMask m)
+  => OsString
+  -> (Handle -> m ())
+  -> (OsPath -> m a)
+  -> m a
+createTmpFile template initialise k = do
+  tmpDir    <- getCanonicalTemporaryDirectory
+  (path, h) <- liftIO $ createTempFile tmpDir template
+  (initialise h `finally` liftIO (hClose h)) `catch` (\SomeException{} -> liftIO $ removeFile path)
+  k path
+

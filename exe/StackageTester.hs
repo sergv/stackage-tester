@@ -66,7 +66,7 @@ data Config = Config
   , cfgExtraCabalConfigFiles :: ![OsPath]
   , cfgGhcExe                :: !(Maybe String)
   , cfgCabalExe              :: !String
-  , cfgKeepTempWorkDir       :: !Bool
+  , cfgKeepTempArtifacts     :: !Bool
   , cfgSkipDeps              :: !Bool
   }
 
@@ -94,9 +94,9 @@ parseConfig = do
     showDefault <>
     help "cabal executable to use"
 
-  cfgKeepTempWorkDir <- switch $
-    long "keep-temp-work-dir" <>
-    help "Don't remove working directories where packages are built for further inspection and debugging"
+  cfgKeepTempArtifacts <- switch $
+    long "keep-tmp" <>
+    help "Don't remove working directories and other temporary files where packages are built for further inspection and debugging"
 
   cfgSkipDeps <- switch $
     long "skip-deps" <>
@@ -246,7 +246,7 @@ main = do
 
   lock <- Lock.new
 
-  withFullyPinnedCabalConfig pkgs' $ \fullyPinnedConfigPath -> do
+  withFullyPinnedCabalConfig (cfgKeepTempArtifacts fcfgSubconfig) pkgs' $ \fullyPinnedConfigPath -> do
 
     withDirs fcfgLogsDir $ \dirs -> do
       let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig fullyPinnedConfigPath) $ maybe id take fcfgLimitTests pkgs'
@@ -290,16 +290,11 @@ cabalBuildFlags enableTests =
       EnableTests -> ["--enable-tests"]
       SkipTests   -> []
 
-createTmpDir :: OsString -> (OsPath -> IO a) -> IO a
-createTmpDir template k = do
-  tmpDir <- getCanonicalTemporaryDirectory
-  k =<< createTempDirectory tmpDir template
-
 mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> FullyPinnedCabalConfig -> Package -> TestTree
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempWorkDir, cfgSkipDeps}
+  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempArtifacts, cfgSkipDeps}
   cabalConfigPath
   pkg =
   testCaseSteps fullPkgName $ \step -> do
@@ -309,7 +304,7 @@ mkTest
         ghcArg     = case cfgGhcExe of
           Nothing -> []
           Just x  -> ["-w", x]
-    (if cfgKeepTempWorkDir then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
+    (if cfgKeepTempArtifacts then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
       let pkgDir :: OsPath
           pkgDir = tmpDir </> fullPkgName'
