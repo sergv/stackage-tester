@@ -339,7 +339,7 @@ mkTest
             withFile buildLogTmp WriteMode $ \buildLogH ->
               runProc buildLogH (Just pkgDir')
                 cfgCabalExe
-                (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j4", "--only-dependencies"])
+                (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", ":all", "-j4", "--only-dependencies"])
                 (do
                   firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                   unless (firstLine == "Up to date") $ do
@@ -367,7 +367,7 @@ mkTest
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
               -- Environment is crucial to make doctests work.
-              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", "all", "-j1", "--write-ghc-environment-files=always"])
+              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", ":all", "-j1", "--write-ghc-environment-files=always"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
