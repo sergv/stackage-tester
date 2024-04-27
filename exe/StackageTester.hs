@@ -396,7 +396,7 @@ mkTest
                 | (CTTestSuite, name) <- components
                 ]
 
-          for_ tests $ \test -> do
+          forConcurrently_ tests $ \test -> do
 
             (test' :: OsPath) <- OsPath.encodeUtf test
 
