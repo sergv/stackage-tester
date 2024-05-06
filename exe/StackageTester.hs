@@ -209,6 +209,10 @@ main = do
   FullConfig{fcfgSubconfig, fcfgLogsDir, fcfgLimitTests, fcfgTastyOpts} <-
     resolveRelativePaths =<< customExecParser (prefs (showHelpOnEmpty <> noBacktrack <> multiSuffix "*")) (progInfo tastyParser)
 
+  findExecutable [osstr|ghci|] >>= \case
+    Nothing -> die $ renderString "Cannot find ‘ghc’ executable in PATH, it’s required for ghcid tests."
+    Just _  -> pure ()
+
   findExecutable [osstr|ghc|] >>= \case
     Nothing   -> die $ renderString "Cannot find ‘ghc’ executable in PATH, it’s required for alex tests."
     Just path -> do
