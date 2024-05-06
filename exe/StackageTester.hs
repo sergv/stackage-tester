@@ -51,13 +51,14 @@ import Prettyprinter.Show
 import System.Directory.OsPath
 import System.Exit
 import System.File.OsPath
+import System.FilePath qualified as FilePath
 import System.IO (IOMode(..), Handle, hClose)
 import System.IO.Temp.OsPath
 import System.OsPath as OsPath
 import System.OsPath.Ext
 import System.OsString (osstr)
 import System.Process.Typed
-import Test.Tasty
+import Test.Tasty hiding (after)
 import Test.Tasty.HUnit
 import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
@@ -301,6 +302,15 @@ cabalBuildFlags enableTests =
       EnableTests -> ["--enable-tests"]
       SkipTests   -> []
 
+-- "downloading blah blah\nblah\nUnpacking to\n/tmp/workdir-type-of-html-static-1a7ec6c8f1a80449/type-of-html-static-0.1.0.2/\n"
+-- "Unpacking to\n/tmp/workdir-type-of-html-static-1a7ec6c8f1a80449/type-of-html-static-0.1.0.2/\n"
+-- "Unpacking to /tmp/workdir-abstract-deque-a87ecf27dac68151/abstract-deque-0.3/\n"
+findUnpackDir :: Text -> Maybe Text
+findUnpackDir output =
+  case T.splitOn "Unpacking to" output of
+    _before : after : [] -> Just $ T.dropWhileEnd FilePath.isPathSeparator $ T.strip after
+    _ -> Nothing
+
 mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Maybe FullyPinnedCabalConfig -> Package -> TestTree
 mkTest
   buildDepsLock
@@ -321,31 +331,23 @@ mkTest
       step "Unpack"
       pkgsDir' <- OsPath.decodeUtf tmpDir
 
-      let findDir :: Text -> Maybe Text
-          findDir str = case T.words str of
-            ["Unpacking", "to", rest] -> Just $ T.strip rest
-            _                         -> Nothing
-
-      (pkgDir' :: String) <- runProcCaptureOutput
+      (pkgDir :: OsPath) <- runProcCaptureOutput
         Nothing
         cfgCabalExe
         ["get", "--destdir", pkgsDir', T.unpack $ pkgName pkg]
         (\stdOut stdErr ->
-          case (T.null stdErr, mapMaybe findDir $ T.lines stdOut) of
-            (False, _)     -> assertFailure $ renderString $
+          case (T.null stdErr, findUnpackDir stdOut) of
+            (False, _)           -> assertFailure $ renderString $
               "Unexpected stderr from ‘cabal unpack’:" ## pretty stdErr
-            (_,     [dir]) ->
-              pure $ T.unpack dir
-            (_,     _)     -> assertFailure $ renderString $
+            (True,     Just dir) ->
+              pure $ pathFromText dir
+            (True,     Nothing)  -> assertFailure $ renderString $
               "Unexpected ‘cabal unpack’ output:" ## pretty (show stdOut))
         (\exitCode stdOut stdErr ->
         "Unpacking of" <+> pretty (pkgName pkg) <+> "failed with exit code" <+> pretty exitCode ## vcat
           [ "Stdout:" ## pretty stdOut
           , "Stderr:" ## pretty stdErr
           ])
-
-      (pkgDir :: OsPath) <- OsPath.encodeUtf pkgDir'
-
 
       let fullPkgName' :: OsPath
           fullPkgName' = L.last $ splitDirectories pkgDir
@@ -375,7 +377,7 @@ mkTest
 
           (`finally` removeFileIfExists buildLogTmp) $
             withFile buildLogTmp WriteMode $ \buildLogH ->
-              runProc buildLogH (Just pkgDir')
+              runProc buildLogH (Just pkgDir)
                 cfgCabalExe
                 (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j4", "--only-dependencies"])
                 (do
@@ -389,7 +391,7 @@ mkTest
                   pure $ ppDictHeader ("Build of dependencies of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
                     [ "Logs location" :-> ppShow dest
                     , "Command"       --> show cmd
-                    , "Directory"     --> pkgDir'
+                    , "Directory"     :-> ppShow pkgDir
                     , "Output"        --> output
                     ])
 
@@ -402,7 +404,7 @@ mkTest
 
         (`finally` removeFileIfExists buildLogTmp) $
           withFile buildLogTmp WriteMode $ \buildLogH ->
-            runProc buildLogH (Just pkgDir')
+            runProc buildLogH (Just pkgDir)
               cfgCabalExe
               -- Environment is crucial to make doctests work.
               (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j1", "--write-ghc-environment-files=always"])
@@ -417,7 +419,7 @@ mkTest
                 pure $ ppDictHeader ("Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
                   [ "Logs location" :-> ppShow dest
                   , "Command"       --> show cmd
-                  , "Directory"     --> pkgDir'
+                  , "Directory"     :-> ppShow pkgDir
                   , "Output"        --> output
                   ])
 
@@ -453,13 +455,13 @@ mkTest
                   pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
                     [ "Logs location" :-> ppShow dest
                     , "Command"       --> show cmd
-                    , "Directory"     --> pkgDir'
+                    , "Directory"     :-> ppShow pkgDir
                     , "Output"        --> output
                     ]
 
             (`finally` removeFileIfExists testLogTmp) $
               withFile testLogTmp WriteMode $ \testLogH ->
-                runProc testLogH (Just pkgDir')
+                runProc testLogH (Just pkgDir)
                   cfgCabalExe
                   (["run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", "."])
                   onSuccess
@@ -501,17 +503,18 @@ mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = d
 runProc
   :: HasCallStack
   => Handle
-  -> Maybe FilePath
+  -> Maybe OsPath
   -> String
   -> [String]
   -> IO ()
   -> ([String] -> Int -> IO (Doc ann))
   -> IO ()
 runProc out cwd cmd args onSuccess msgOnError = do
+  cwd' <- traverse OsPath.decodeUtf cwd
   let p = setStdin nullStream
         $ setStdout (useHandleClose out)
         $ setStderr (useHandleClose out)
-        $ maybe id setWorkingDir cwd
+        $ maybe id setWorkingDir cwd'
         $ proc cmd args
 
   when debug $
