@@ -34,6 +34,7 @@ import Data.Foldable
 import Data.List qualified as L
 import Data.Lock (Lock)
 import Data.Lock qualified as Lock
+import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Text (Text)
@@ -43,7 +44,7 @@ import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
 import Distribution.Types.UnqualComponentName
 import GHC.Stack
-import Options.Applicative
+import Options.Applicative hiding (str)
 import Prettyprinter hiding (dquote)
 import Prettyprinter.Combinators
 import Prettyprinter.Show
@@ -62,12 +63,13 @@ import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
 data Config = Config
-  { cfgCabalConfigFile       :: !RawCabalConfig
-  , cfgExtraCabalConfigFiles :: ![OsPath]
-  , cfgGhcExe                :: !(Maybe String)
-  , cfgCabalExe              :: !String
-  , cfgKeepTempArtifacts     :: !Bool
-  , cfgSkipDeps              :: !Bool
+  { cfgCabalConfigFile         :: !RawCabalConfig
+  , cfgExtraCabalConfigFiles   :: ![OsPath]
+  , cfgGhcExe                  :: !(Maybe String)
+  , cfgCabalExe                :: !String
+  , cfgKeepTempArtifacts       :: !Bool
+  , cfgSkipDeps                :: !Bool
+  , cfgStickToStackagePackages :: !Bool
   }
 
 parseConfig :: Parser Config
@@ -101,6 +103,10 @@ parseConfig = do
   cfgSkipDeps <- switch $
     long "skip-deps" <>
     help "Skip building dependencies, use with caution"
+
+  cfgStickToStackagePackages <- switch $
+    long "stick-to-stackage-packages" <>
+    help "Only use packages from stackage snapshot disallowing any other packages (modulo bugs in the tool). I.e. if not provided then --cabal-config-main will just supply package names and versions will be taken the latest possible (will download the latest but during build will stick to constraints imposed by individual packages)"
 
   pure Config{..}
 
@@ -246,7 +252,13 @@ main = do
 
   lock <- Lock.new
 
-  withFullyPinnedCabalConfig (cfgKeepTempArtifacts fcfgSubconfig) pkgs $ \fullyPinnedConfigPath -> do
+  let withMaybeCabalConfig k
+        | cfgStickToStackagePackages fcfgSubconfig
+        = withFullyPinnedCabalConfig (cfgKeepTempArtifacts fcfgSubconfig) pkgs (k . Just)
+        | otherwise
+        = k Nothing
+
+  withMaybeCabalConfig $ \fullyPinnedConfigPath -> do
 
     withDirs fcfgLogsDir $ \dirs -> do
       let allTests = testGroup "Tests" $ map (mkTest lock dirs fcfgSubconfig fullyPinnedConfigPath) $ maybe id take fcfgLimitTests pkgs'
@@ -278,7 +290,6 @@ cabalBuildFlags enableTests =
   , "--disable-executable-static"
   , "--disable-profiling"
   , "--disable-documentation"
-  , "--allow-newer"
   , "--enable-optimization"
   , "--remote-build-reporting=none"
   , "--enable-executable-stripping"
@@ -290,42 +301,69 @@ cabalBuildFlags enableTests =
       EnableTests -> ["--enable-tests"]
       SkipTests   -> []
 
-mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> FullyPinnedCabalConfig -> Package -> TestTree
+mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Maybe FullyPinnedCabalConfig -> Package -> TestTree
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempArtifacts, cfgSkipDeps}
+  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempArtifacts, cfgSkipDeps, cfgStickToStackagePackages}
   cabalConfigPath
   pkg =
-  testCaseSteps fullPkgName $ \step -> do
-    (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
+  testCaseSteps (T.unpack (pkgName pkg)) $ \step -> do
 
-    let tmpWorkDir = ([osp|workdir-|] <> fullPkgName')
+    (pkgName' :: OsPath) <- OsPath.encodeUtf $ T.unpack $ pkgName pkg
+
+    let tmpWorkDir = ([osp|workdir-|] <> pkgName')
         ghcArg     = case cfgGhcExe of
           Nothing -> []
           Just x  -> ["-w", x]
     (if cfgKeepTempArtifacts then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
-      let pkgDir :: OsPath
-          pkgDir = tmpDir </> fullPkgName'
+      step "Unpack"
+      pkgsDir' <- OsPath.decodeUtf tmpDir
 
-      alreadyDownloaded <- doesDirectoryExist pkgDir
-      unless alreadyDownloaded $ do
-        step "Unpack"
-        pkgsDir' <- OsPath.decodeUtf tmpDir
-        runProc' Nothing cfgCabalExe ["get", "--destdir", pkgsDir', fullPkgName] $ \exitCode stdOut stdErr ->
-          "Unpacking of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode ## vcat
-            [ "Stdout:" ## pretty stdOut
-            , "Stderr:" ## pretty stdErr
-            ]
+      let findDir :: Text -> Maybe Text
+          findDir str = case T.words str of
+            ["Unpacking", "to", rest] -> Just $ T.strip rest
+            _                         -> Nothing
 
-      pkgDir' <- OsPath.decodeUtf pkgDir
+      (pkgDir' :: String) <- runProcCaptureOutput
+        Nothing
+        cfgCabalExe
+        ["get", "--destdir", pkgsDir', T.unpack $ pkgName pkg]
+        (\stdOut stdErr ->
+          case (T.null stdErr, mapMaybe findDir $ T.lines stdOut) of
+            (False, _)     -> assertFailure $ renderString $
+              "Unexpected stderr from ‘cabal unpack’:" ## pretty stdErr
+            (_,     [dir]) ->
+              pure $ T.unpack dir
+            (_,     _)     -> assertFailure $ renderString $
+              "Unexpected ‘cabal unpack’ output:" ## pretty (show stdOut))
+        (\exitCode stdOut stdErr ->
+        "Unpacking of" <+> pretty (pkgName pkg) <+> "failed with exit code" <+> pretty exitCode ## vcat
+          [ "Stdout:" ## pretty stdOut
+          , "Stderr:" ## pretty stdErr
+          ])
 
+      (pkgDir :: OsPath) <- OsPath.encodeUtf pkgDir'
+
+
+      let fullPkgName' :: OsPath
+          fullPkgName' = L.last $ splitDirectories pkgDir
+
+      (fullPkgName :: String) <- OsPath.decodeUtf fullPkgName'
+      -- (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
+
+      -- pkgDir'   <- OsPath.decodeUtf pkgDir
       cabalFile <- mkCabalProjectLocal pkg (AbsDir pkgDir) cabalConfigPath cfgExtraCabalConfigFiles
 
       let runTests
             | pkgName pkg `S.member` packagesSkipTest = SkipTests
             | otherwise                               = EnableTests
+
+          allowNewerArg :: [String]
+          allowNewerArg
+            | cfgStickToStackagePackages = ["--allow-newer"] -- To combat revisions
+            | otherwise                  = []
 
       unless cfgSkipDeps $ do
         step "Build (--only-deps)"
@@ -339,7 +377,7 @@ mkTest
             withFile buildLogTmp WriteMode $ \buildLogH ->
               runProc buildLogH (Just pkgDir')
                 cfgCabalExe
-                (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", ":all", "-j4", "--only-dependencies"])
+                (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j4", "--only-dependencies"])
                 (do
                   firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                   unless (firstLine == "Up to date") $ do
@@ -367,7 +405,7 @@ mkTest
             runProc buildLogH (Just pkgDir')
               cfgCabalExe
               -- Environment is crucial to make doctests work.
-              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", ".", ":all", "-j1", "--write-ghc-environment-files=always"])
+              (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j1", "--write-ghc-environment-files=always"])
               (do
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
@@ -423,14 +461,11 @@ mkTest
               withFile testLogTmp WriteMode $ \testLogH ->
                 runProc testLogH (Just pkgDir')
                   cfgCabalExe
-                  (["run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ ["--project-dir", "."])
+                  (["run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", "."])
                   onSuccess
                   onFailure
 
       pure ()
-  where
-    fullPkgName :: String
-    fullPkgName = T.unpack $ getFullPkgName pkg
 
 removeFileIfExists :: OsPath -> IO ()
 removeFileIfExists path = do
@@ -438,13 +473,13 @@ removeFileIfExists path = do
   when exists $
     removeFile path
 
-mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> FullyPinnedCabalConfig -> [OsPath] -> IO AbsFile
+mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> Maybe FullyPinnedCabalConfig -> [OsPath] -> IO AbsFile
 mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = do
   let importStr :: Text
       importStr
         = T.unlines
-        $ map (\p -> "import: " <> pathToText p)
-        $ unFullyPinnedCabalConfig cabalConfigFile : extraConfigs
+        $ mapMaybe (\p -> (("import: " <>) . pathToText) <$> p)
+        $ (unFullyPinnedCabalConfig <$> cabalConfigFile) : map Just extraConfigs
 
   haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
   cabalFile        <- do
@@ -491,13 +526,13 @@ runProc out cwd cmd args onSuccess msgOnError = do
       ExitSuccess   ->
         onSuccess
 
-runProc'
+_runProc'
   :: Maybe FilePath
   -> String
   -> [String]
   -> (Int -> Text -> Text -> Doc ann)
   -> IO ()
-runProc' cwd cmd args msgOnError = do
+_runProc' cwd cmd args msgOnError = do
   runProcCaptureOutput cwd cmd args (\_ _ -> pure ()) msgOnError
 
 runProcCaptureOutput
