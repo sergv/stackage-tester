@@ -35,6 +35,7 @@ import Data.List qualified as L
 import Data.Lock (Lock)
 import Data.Lock qualified as Lock
 import Data.Maybe (mapMaybe)
+import Data.Monoid
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Text (Text)
@@ -42,6 +43,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
+import Data.Void (Void)
 import Distribution.Types.UnqualComponentName
 import GHC.Stack
 import Options.Applicative hiding (str)
@@ -440,7 +442,7 @@ mkTest
                 | (CTTestSuite, name) <- components
                 ]
 
-          for_ tests $ \test -> do
+          (failures :: [Doc Void]) <- getAp $ (`foldMap` tests) $ \test -> Ap $ do
 
             (test' :: OsPath) <- OsPath.encodeUtf test
 
@@ -449,27 +451,35 @@ mkTest
 
                 testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
 
+                onSuccess :: IO [Doc Void]
                 onSuccess = do
                   renameFile testLogTmp (dcTestLogsSuccessDir </> testLog)
+                  pure mempty
 
+                onFailure :: [String] -> Int -> IO [Doc Void]
                 onFailure cmd exitCode = do
                   let dest = dcTestLogsFailedDir </> testLog
                   renameFile testLogTmp dest
                   output <- T.decodeUtf8 <$> readFile' dest
-                  pure $ ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                    [ "Logs location" :-> ppShow dest
-                    , "Command"       --> show cmd
-                    , "Directory"     :-> ppShow pkgDir
-                    , "Output"        --> output
-                    ]
+                  pure $ (: []) $
+                    ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
+                      [ "Logs location" :-> ppShow dest
+                      , "Command"       --> show cmd
+                      , "Directory"     :-> ppShow pkgDir
+                      , "Output"        --> output
+                      ]
 
             (`finally` removeFileIfExists testLogTmp) $
               withFile testLogTmp WriteMode $ \testLogH ->
-                runProc testLogH (Just pkgDir)
+                runProc' testLogH (Just pkgDir)
                   cfgCabalExe
                   (["test", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", "--write-ghc-environment-files=always"])
                   onSuccess
                   onFailure
+
+          case failures of
+            [] -> pure ()
+            xs -> assertFailure $ renderString $ "Some tests failed" ## vsep xs
 
       pure ()
 
@@ -513,7 +523,19 @@ runProc
   -> IO ()
   -> ([String] -> Int -> IO (Doc ann))
   -> IO ()
-runProc out cwd cmd args onSuccess msgOnError = do
+runProc out cwd cmd args onSuccess msgOnError =
+  runProc' out cwd cmd args onSuccess (\cmd' code -> assertFailure . renderString =<< msgOnError cmd' code)
+
+runProc'
+  :: HasCallStack
+  => Handle
+  -> Maybe OsPath
+  -> String
+  -> [String]
+  -> IO a
+  -> ([String] -> Int -> IO a)
+  -> IO a
+runProc' out cwd cmd args onSuccess msgOnError = do
   cwd' <- traverse OsPath.decodeUtf cwd
   let p = setStdin nullStream
         $ setStdout (useHandleClose out)
@@ -529,18 +551,9 @@ runProc out cwd cmd args onSuccess msgOnError = do
     hClose out
     case exitCode of
       ExitFailure x ->
-        assertFailure . renderString =<< msgOnError (cmd : args) x
+        msgOnError (cmd : args) x
       ExitSuccess   ->
         onSuccess
-
-_runProc'
-  :: Maybe FilePath
-  -> String
-  -> [String]
-  -> (Int -> Text -> Text -> Doc ann)
-  -> IO ()
-_runProc' cwd cmd args msgOnError = do
-  runProcCaptureOutput cwd cmd args (\_ _ -> pure ()) msgOnError
 
 runProcCaptureOutput
   :: HasCallStack
