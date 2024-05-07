@@ -467,7 +467,7 @@ mkTest
               withFile testLogTmp WriteMode $ \testLogH ->
                 runProc testLogH (Just pkgDir)
                   cfgCabalExe
-                  (["test", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", "."])
+                  (["test", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", "--write-ghc-environment-files=always"])
                   onSuccess
                   onFailure
 
