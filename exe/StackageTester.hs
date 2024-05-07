@@ -440,7 +440,7 @@ mkTest
                 | (CTTestSuite, name) <- components
                 ]
 
-          forConcurrently_ tests $ \test -> do
+          for_ tests $ \test -> do
 
             (test' :: OsPath) <- OsPath.encodeUtf test
 
@@ -467,7 +467,7 @@ mkTest
               withFile testLogTmp WriteMode $ \testLogH ->
                 runProc testLogH (Just pkgDir)
                   cfgCabalExe
-                  (["run", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", "."])
+                  (["test", "test:" ++ test] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", "."])
                   onSuccess
                   onFailure
 
