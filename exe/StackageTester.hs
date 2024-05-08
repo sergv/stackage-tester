@@ -337,10 +337,14 @@ mkTest
       step "Unpack"
       pkgsDir' <- OsPath.decodeUtf tmpDir
 
+      let pkgToDownload
+            | cfgStickToStackagePackages = getFullPkgName pkg -- with version to downlead what’s in snapshot
+            | otherwise                  = pkgName pkg        -- no version to get the latest
+
       (pkgDir :: OsPath) <- runProcCaptureOutput
         Nothing
         cfgCabalExe
-        ["get", "--destdir", pkgsDir', T.unpack $ pkgName pkg]
+        ["get", "--destdir", pkgsDir', T.unpack pkgToDownload]
         (\stdOut stdErr ->
           case (T.null stdErr, findUnpackDir stdOut) of
             (False, _)           -> assertFailure $ renderString $
@@ -356,13 +360,13 @@ mkTest
           ])
 
       let fullPkgName' :: OsPath
-          fullPkgName' = L.last $ splitDirectories pkgDir
+          fullPkgName' = takeFileName pkgDir
 
       (fullPkgName :: String) <- OsPath.decodeUtf fullPkgName'
       -- (fullPkgName' :: OsPath) <- OsPath.encodeUtf fullPkgName
 
       -- pkgDir'   <- OsPath.decodeUtf pkgDir
-      cabalFile <- mkCabalProjectLocal pkg (AbsDir pkgDir) cabalConfigPath cfgExtraCabalConfigFiles
+      cabalFile <- mkCabalProjectLocal fullPkgName' pkg (AbsDir pkgDir) cabalConfigPath cfgExtraCabalConfigFiles
 
       let runTests
             | pkgName pkg `S.member` packagesSkipTest = SkipTests
@@ -489,8 +493,8 @@ removeFileIfExists path = do
   when exists $
     removeFile path
 
-mkCabalProjectLocal :: HasCallStack => Package -> AbsDir -> Maybe FullyPinnedCabalConfig -> [OsPath] -> IO AbsFile
-mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = do
+mkCabalProjectLocal :: HasCallStack => OsString -> Package -> AbsDir -> Maybe FullyPinnedCabalConfig -> [OsPath] -> IO AbsFile
+mkCabalProjectLocal fullPkgName Package{pkgName} pkgDir cabalConfigFile extraConfigs = do
   let importStr :: Text
       importStr
         = T.unlines
@@ -503,7 +507,7 @@ mkCabalProjectLocal pkg@Package{pkgName} pkgDir cabalConfigFile extraConfigs = d
     -- cabalFiles <- findAllCollect ((== (pathFromText pkgName <.> [osstr|cabal|])) . unRelFile) $ pkgDir :| []
     let cabalFile = pathFromText pkgName <.> [osstr|cabal|]
     case L.find ((== cabalFile)) toplevelFiles of
-      Nothing -> error $ renderString $ "Could not locate cabal file for package" <+> pretty (getFullPkgName pkg) <+> "in its toplevel directory" <+> pretty pkgDir
+      Nothing -> error $ renderString $ "Could not locate cabal file for package" <+> ppShow fullPkgName <+> "in its toplevel directory" <+> pretty pkgDir
       Just x  -> pure $ AbsFile $ unAbsDir pkgDir </> x
 
   writeFile' (unAbsDir pkgDir </> [osp|cabal.project.local|]) $ T.encodeUtf8 $ T.unlines $
