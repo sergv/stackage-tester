@@ -328,11 +328,11 @@ mkTest
 
     (pkgName' :: OsPath) <- OsPath.encodeUtf $ T.unpack $ pkgName pkg
 
-    let tmpWorkDir = ([osp|workdir-|] <> pkgName')
+    let tmpWorkDir = [osp|workdir-|] <> pkgName'
         ghcArg     = case cfgGhcExe of
           Nothing -> []
           Just x  -> ["-w", x]
-    (if cfgKeepTempArtifacts then createTmpDir tmpWorkDir else withSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
+    (if cfgKeepTempArtifacts then createTmpDir tmpWorkDir else withDeterministicSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
       step "Unpack"
       pkgsDir' <- OsPath.decodeUtf tmpDir

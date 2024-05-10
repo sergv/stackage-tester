@@ -13,12 +13,14 @@ module System.IO.Temp.OsPath
   , withSystemTempFileContents
   , createTmpDir
   , createTmpFile
+
+  , withDeterministicSystemTempDirectory
   ) where
 
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
-import System.Directory.OsPath (removeFile)
+import System.Directory.OsPath
 import System.IO (Handle, hClose, openBinaryTempFile)
 import System.IO.Temp qualified
 import System.OsPath
@@ -85,3 +87,26 @@ createTmpFile template initialise k = do
   (initialise h `finally` liftIO (hClose h)) `catch` (\SomeException{} -> liftIO $ removeFile path)
   k path
 
+-- Like 'withSystemTempDirectory' but don't generate random name and use provided template as is.
+-- If desired directory already exists throw an error.
+withDeterministicSystemTempDirectory
+  :: (MonadIO m, MonadMask m, MonadFail m)
+  => OsString        -- ^ Directory name template
+  -> (OsPath -> m a) -- ^ Callback that can use the directory
+  -> m a
+withDeterministicSystemTempDirectory template k = do
+  tmpDir <- getCanonicalTemporaryDirectory
+  let dest = tmpDir </> template
+  exists <- liftIO $ doesDirectoryExist dest
+  if exists
+  then do
+    dest' <- decodeUtf dest
+    fail $ "Directory " ++ dest' ++ " already exists"
+  else do
+    bracket_
+      (liftIO $ createDirectory dest)
+      (liftIO $ ignoringIOErrors $ removeDirectoryRecursive dest)
+      (k dest)
+
+ignoringIOErrors :: IO () -> IO ()
+ignoringIOErrors ioe = ioe `catch` (\e -> const (return ()) (e :: IOError))
