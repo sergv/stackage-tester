@@ -279,14 +279,6 @@ main = do
 
       pure ()
 
--- data LocatedDoc = LocatedDoc
---   { ldMsg       :: !(Doc Void)
---   , ldCallStack :: CallStack
---   }
---
--- instance Pretty LocatedDoc where
---   pretty (LocatedDoc msg stack) = vacuous msg ## ppCallStack stack
-
 data EnableTests = EnableTests | SkipTests
 
 cabalBuildFlags :: EnableTests -> [String]
@@ -315,7 +307,7 @@ findUnpackDir :: Text -> Maybe Text
 findUnpackDir output =
   case T.splitOn "Unpacking to" output of
     _before : after : [] -> Just $ T.dropWhileEnd FilePath.isPathSeparator $ T.strip after
-    _ -> Nothing
+    _                    -> Nothing
 
 mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Maybe FullyPinnedCabalConfig -> Package -> TestTree
 mkTest
@@ -354,10 +346,10 @@ mkTest
             (True,     Nothing)  -> assertFailure $ renderString $
               "Unexpected ‘cabal unpack’ output:" ## pretty (show stdOut))
         (\exitCode stdOut stdErr ->
-        "Unpacking of" <+> pretty (pkgName pkg) <+> "failed with exit code" <+> pretty exitCode ## vcat
-          [ "Stdout:" ## pretty stdOut
-          , "Stderr:" ## pretty stdErr
-          ])
+          "Unpacking of" <+> pretty (pkgName pkg) <+> "failed with exit code" <+> pretty exitCode ## vcat
+            [ "Stdout:" ## pretty stdOut
+            , "Stderr:" ## pretty stdErr
+            ])
 
       let fullPkgName' :: OsPath
           fullPkgName' = takeFileName pkgDir
@@ -468,11 +460,13 @@ mkTest
 
                 onSuccess :: IO [Doc Void]
                 onSuccess = do
+                  removeFileIfExists failDest
                   renameFile testLogTmp successDest
                   pure mempty
 
                 onFailure :: [String] -> Int -> IO [Doc Void]
                 onFailure cmd exitCode = do
+                  removeFileIfExists successDest
                   renameFile testLogTmp failDest
                   output <- T.decodeUtf8 <$> readFile' failDest
                   pure $ (: []) $
@@ -517,7 +511,8 @@ mkCabalProjectLocal fullPkgName Package{pkgName} pkgDir cabalConfigFile extraCon
     -- cabalFiles <- findAllCollect ((== (pathFromText pkgName <.> [osstr|cabal|])) . unRelFile) $ pkgDir :| []
     let cabalFile = pathFromText pkgName <.> [osstr|cabal|]
     case L.find ((== cabalFile)) toplevelFiles of
-      Nothing -> error $ renderString $ "Could not locate cabal file for package" <+> ppShow fullPkgName <+> "in its toplevel directory" <+> pretty pkgDir
+      Nothing -> error $ renderString $
+        "Could not locate cabal file for package" <+> ppShow fullPkgName <+> "in its toplevel directory" <+> pretty pkgDir
       Just x  -> pure $ AbsFile $ unAbsDir pkgDir </> x
 
   writeFile' (unAbsDir pkgDir </> [osp|cabal.project.local|]) $ T.encodeUtf8 $ T.unlines $
