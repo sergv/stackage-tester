@@ -385,21 +385,25 @@ mkTest
 
               buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
 
+              successDest = dcBuildLogsSuccessDir </> buildLog
+              failDest    = dcBuildLogsFailedDir </> buildLog
+
           (`finally` removeFileIfExists buildLogTmp) $
             withFile buildLogTmp WriteMode $ \buildLogH ->
               runProc buildLogH (Just pkgDir)
                 cfgCabalExe
                 (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j4", "--only-dependencies"])
                 (do
+                  removeFileIfExists failDest
                   firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                   unless (firstLine == "Up to date") $ do
-                    renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
+                    renameFile buildLogTmp successDest)
                 (\cmd exitCode -> do
-                  let dest = dcBuildLogsFailedDir </> buildLog
-                  renameFile buildLogTmp dest
-                  output <- T.decodeUtf8 <$> readFile' dest
+                  removeFileIfExists successDest
+                  renameFile buildLogTmp failDest
+                  output <- T.decodeUtf8 <$> readFile' failDest
                   pure $ ppDictHeader ("Build of dependencies of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                    [ "Logs location" :-> ppShow dest
+                    [ "Logs location" :-> ppShow failDest
                     , "Command"       --> show cmd
                     , "Directory"     :-> ppShow pkgDir
                     , "Output"        --> output
@@ -412,6 +416,9 @@ mkTest
 
             buildLogTmp = dcLogsDir </> buildLog <> [osstr|.tmp|]
 
+            successDest = dcBuildLogsSuccessDir </> buildLog
+            failDest    = dcBuildLogsFailedDir  </> buildLog
+
         (`finally` removeFileIfExists buildLogTmp) $
           withFile buildLogTmp WriteMode $ \buildLogH ->
             runProc buildLogH (Just pkgDir)
@@ -419,15 +426,16 @@ mkTest
               -- Environment is crucial to make doctests work.
               (["build"] ++ cabalBuildFlags runTests ++ ghcArg ++ allowNewerArg ++ ["--project-dir", ".", ":all", "-j1", "--write-ghc-environment-files=always"])
               (do
+                removeFileIfExists failDest
                 firstLine <- withFile buildLogTmp ReadMode C8.hGetLine
                 unless (firstLine == "Up to date") $ do
-                  renameFile buildLogTmp (dcBuildLogsSuccessDir </> buildLog))
+                  renameFile buildLogTmp successDest)
               (\cmd exitCode -> do
-                let dest = dcBuildLogsFailedDir </> buildLog
-                renameFile buildLogTmp dest
-                output <- T.decodeUtf8 <$> readFile' dest
+                removeFileIfExists successDest
+                renameFile buildLogTmp failDest
+                output <- T.decodeUtf8 <$> readFile' failDest
                 pure $ ppDictHeader ("Build of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                  [ "Logs location" :-> ppShow dest
+                  [ "Logs location" :-> ppShow failDest
                   , "Command"       --> show cmd
                   , "Directory"     :-> ppShow pkgDir
                   , "Output"        --> output
@@ -455,19 +463,21 @@ mkTest
 
                 testLogTmp = dcLogsDir </> testLog <> [osstr|.tmp|]
 
+                successDest = dcTestLogsSuccessDir </> testLog
+                failDest    = dcTestLogsFailedDir </> testLog
+
                 onSuccess :: IO [Doc Void]
                 onSuccess = do
-                  renameFile testLogTmp (dcTestLogsSuccessDir </> testLog)
+                  renameFile testLogTmp successDest
                   pure mempty
 
                 onFailure :: [String] -> Int -> IO [Doc Void]
                 onFailure cmd exitCode = do
-                  let dest = dcTestLogsFailedDir </> testLog
-                  renameFile testLogTmp dest
-                  output <- T.decodeUtf8 <$> readFile' dest
+                  renameFile testLogTmp failDest
+                  output <- T.decodeUtf8 <$> readFile' failDest
                   pure $ (: []) $
                     ppDictHeader ("Test of" <+> pretty fullPkgName <+> "failed with exit code" <+> pretty exitCode)
-                      [ "Logs location" :-> ppShow dest
+                      [ "Logs location" :-> ppShow failDest
                       , "Command"       --> show cmd
                       , "Directory"     :-> ppShow pkgDir
                       , "Output"        --> output
