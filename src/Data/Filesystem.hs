@@ -24,7 +24,6 @@ import Data.IORef
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.NBSem
 import GHC.Stack (HasCallStack)
-import Prettyprinter (Pretty(..))
 import Prettyprinter.Show
 import System.Directory.OsPath.FileType as Streaming
 import System.Directory.OsPath.Streaming as Streaming
