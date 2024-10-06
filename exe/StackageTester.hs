@@ -236,7 +236,7 @@ main = do
               ]
           pure ()
 
-  for_ [([osstr|hspec-discover|], "hspec-discover"), ([osstr|tasty-discover|], "tasty-discover"), ([osstr|doctest-driver-gen|], "doctest-driver-gen"), ([osstr|htfpp|], "HTF")] $ \(exe, (pkg :: Doc ann)) ->
+  for_ [([osstr|hspec-discover|], "hspec-discover"), ([osstr|tasty-discover|], "tasty-discover"), ([osstr|doctest-discover|], "doctest-discover"), ([osstr|doctest-driver-gen|], "doctest-driver-gen"), ([osstr|htfpp|], "HTF")] $ \(exe, (pkg :: Doc ann)) ->
     findExecutable exe >>= \case
       Nothing -> die $ renderString $ "Cannot find" <+> ppShow exe <+> "executable in PATH, it’s required for building some packages. Try ‘cabal install" <+> pkg <> "’"
       Just{}  -> pure ()
