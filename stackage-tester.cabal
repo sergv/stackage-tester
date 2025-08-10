@@ -14,8 +14,6 @@ copyright:
   (c) Sergey Vinokurov 2024
 license:
   Apache-2.0
--- license-file:
---   LICENSE
 author:
   Sergey Vinokurov
 maintainer:
@@ -23,13 +21,6 @@ maintainer:
 
 build-type:
   Simple
-
--- build-type: Custom
---
--- custom-setup
---   setup-depends:
---     , base >= 4.16
---     , Cabal >= 1.16
 
 extra-source-files:
   Changelog.md
@@ -56,7 +47,6 @@ common ghc-options
     -Wno-missed-specialisations
     -Wno-missing-import-lists
     -Wno-missing-local-signatures
-    -Wno-missing-safe-haskell-mode
     -Wno-safe
     -Wno-unsafe
 
@@ -64,9 +54,10 @@ common ghc-options
     ghc-options:
       -Wno-missing-deriving-strategies
 
-  -- if impl(ghc >= 8.10)
-  --   ghc-options:
-  --     -Wno-prepositive-qualified-module
+  if impl(ghc >= 8.10)
+    ghc-options:
+      -Wno-missing-safe-haskell-mode
+      -- -Wno-prepositive-qualified-module
 
   if impl(ghc >= 9.2)
     ghc-options:
