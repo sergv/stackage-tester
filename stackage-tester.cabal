@@ -73,9 +73,7 @@ library
   exposed-modules:
     Data.Cabal
     Data.CabalConfig
-    Data.Filesystem
     Data.Lock
-    Data.NBSem
     System.OsPath.Ext
     System.IO.Temp.OsPath
   hs-source-dirs:
