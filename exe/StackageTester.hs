@@ -29,7 +29,6 @@ import Data.ByteString.Char8 qualified as C8
 import Data.Cabal
 import Data.CabalConfig
 import Data.Coerce (coerce)
-import Data.Filesystem
 import Data.Foldable
 import Data.List qualified as L
 import Data.Lock (Lock)
@@ -65,12 +64,19 @@ import Test.Tasty.HUnit
 import Test.Tasty.Options qualified as Tasty
 import Test.Tasty.Runners qualified as Tasty
 
+newtype AbsDir  = AbsDir  { unAbsDir  :: OsPath }
+newtype AbsFile = AbsFile { unAbsFile :: OsPath }
+
+instance Pretty AbsDir  where pretty = ppShow . unAbsDir
+instance Pretty AbsFile where pretty = ppShow . unAbsFile
+
 data Config = Config
   { cfgCabalConfigFile         :: !RawCabalConfig
   , cfgExtraCabalConfigFiles   :: ![OsPath]
   , cfgGhcExe                  :: !(Maybe String)
   , cfgCabalExe                :: !String
   , cfgKeepTempArtifacts       :: !Bool
+  , cfgOnlyDeps                :: !Bool
   , cfgSkipDeps                :: !Bool
   , cfgStickToStackagePackages :: !Bool
   }
@@ -102,6 +108,10 @@ parseConfig = do
   cfgKeepTempArtifacts <- switch $
     long "keep-tmp" <>
     help "Don't remove working directories and other temporary files where packages are built for further inspection and debugging"
+
+  cfgOnlyDeps <- switch $
+    long "only-deps" <>
+    help "Only build dependencies to keep logs clean"
 
   cfgSkipDeps <- switch $
     long "skip-deps" <>
@@ -313,7 +323,7 @@ mkTest :: HasCallStack => Lock "deps-build" -> DirConfig -> Config -> Maybe Full
 mkTest
   buildDepsLock
   DirConfig{dcLogsDir, dcBuildLogsSuccessDir, dcBuildLogsFailedDir, dcTestLogsSuccessDir, dcTestLogsFailedDir}
-  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempArtifacts, cfgSkipDeps, cfgStickToStackagePackages}
+  Config{cfgExtraCabalConfigFiles, cfgGhcExe, cfgCabalExe, cfgKeepTempArtifacts, cfgOnlyDeps, cfgSkipDeps, cfgStickToStackagePackages}
   cabalConfigPath
   pkg =
   testCaseSteps (T.unpack (pkgName pkg)) $ \step -> do
@@ -401,7 +411,7 @@ mkTest
                     , "Output"        --> output
                     ])
 
-      do
+      unless cfgOnlyDeps $ do
         step "Build"
         let buildLog :: OsPath
             buildLog = [osstr|build-|] <> fullPkgName' <.> [osstr|log|]
@@ -433,9 +443,10 @@ mkTest
                   , "Output"        --> output
                   ])
 
-      case runTests of
-        SkipTests   -> step "Tests skipped"
-        EnableTests -> do
+      case (cfgOnlyDeps, runTests) of
+        (True, _)           -> pure ()
+        (_,    SkipTests)   -> step "Tests skipped"
+        (_,    EnableTests) -> do
           step "Test"
 
           components <- either assertFailure pure =<< runExceptT (getCabalComponents (unAbsFile cabalFile))
@@ -599,11 +610,13 @@ runProcCaptureOutput cwd cmd args processOutput msgOnError = do
 
 packagesSkipTest :: Set Text
 packagesSkipTest = S.fromList
-  [ "haskoin-node"
+  [
+  -- These require extra external programs to run tests.
+    "haskoin-node"
   , "hedis"
   , "skews"
   , "zeromq4-patterns"
-  , "amqp" -- Tests are missing module in Hackage distribution and cannot be built
+  -- , "amqp" -- Tests are missing module in Hackage distribution and cannot be built
   , "cabal-install" -- Depends on 'Cabal-described' package which is not on Hackage
   ]
 
