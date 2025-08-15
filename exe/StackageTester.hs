@@ -519,7 +519,10 @@ mkCabalProjectLocal fullPkgName Package{pkgName} pkgDir cabalConfigFile extraCon
         $ mapMaybe (\p -> (("import: " <>) . pathToText) <$> p)
         $ (unFullyPinnedCabalConfig <$> cabalConfigFile) : map Just extraConfigs
 
-  haveCabalProject <- doesFileExist $ unAbsDir pkgDir </> [osp|cabal.project|]
+  let cabalProjectPath = unAbsDir pkgDir </> [osp|cabal.project|]
+  haveCabalProject <- doesFileExist cabalProjectPath
+  when haveCabalProject $
+    removeFile cabalProjectPath
   cabalFile        <- do
     toplevelFiles <- listDirectory $ unAbsDir pkgDir
     -- cabalFiles <- findAllCollect ((== (pathFromText pkgName <.> [osstr|cabal|])) . unRelFile) $ pkgDir :| []
