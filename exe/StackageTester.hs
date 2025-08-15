@@ -107,7 +107,7 @@ parseConfig = do
 
   cfgKeepTempArtifacts <- switch $
     long "keep-tmp" <>
-    help "Don't remove working directories and other temporary files where packages are built for further inspection and debugging"
+    help "Don't remove working directories and other temporary files where packages are built for further inspection and debugging. Temporary directories will be unique in each run so this will worsen the diffs so only use for debugging."
 
   cfgOnlyDeps <- switch $
     long "only-deps" <>
@@ -334,6 +334,9 @@ mkTest
         ghcArg     = case cfgGhcExe of
           Nothing -> []
           Just x  -> ["-w", x]
+    -- Create fresh directory if we’re keeping temporary files so that
+    -- on subsequent run the kept directory won’t interfere.
+    -- ‘Production’ run is supposed to run without --keep-tmp anyway.
     (if cfgKeepTempArtifacts then createTmpDir tmpWorkDir else withDeterministicSystemTempDirectory tmpWorkDir) $ \tmpDir -> do
 
       step "Unpack"
