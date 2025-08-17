@@ -80,19 +80,15 @@ library
     src
   build-depends:
     , Cabal >= 3.10
-    , async
     , base >= 4.16
     , bytestring >= 0.10.2
     , directory
-    , directory-ospath-streaming
     , exceptions
     , file-io
     , filepath >= 1.5
     , mtl
-    , prettyprinter
     , prettyprinter-combinators
     , os-string
-    , stm
     , temporary
     , text
 
